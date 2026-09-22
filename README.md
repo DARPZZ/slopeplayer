@@ -253,6 +253,21 @@ docker compose up -d
 docker compose logs -f trainer
 ```
 
+After pulling code changes, always rebuild and replace the existing container so
+the Compose arguments and the Python code in the image stay in sync:
+
+```bash
+docker compose down
+docker compose build --pull
+docker compose up -d --force-recreate
+docker compose logs -f trainer
+```
+
+An `unrecognized arguments` message for options present in `compose.yaml` means
+the service is still running an older image. The rebuild above fixes that
+version mismatch. The entrypoint automatically chooses a free virtual display,
+so stale Xvfb locks left by a failed restart no longer break the next attempt.
+
 The first build downloads bundled Chromium and CPU-only PyTorch. Defaults in
 `.env.example` train one game for 100,000 aggregate steps and resume
 `models/slope_ppo_features.zip` when it exists. The VPS profile uses the compact

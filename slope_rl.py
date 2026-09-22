@@ -37,9 +37,10 @@ try:
         VecMonitor,
     )
 except ImportError as exc:
-    missing = getattr(exc, "name", "a reinforcement-learning package")
+    missing = getattr(exc, "name", None)
+    problem = f"Missing {missing}" if missing else f"Could not load an RL dependency: {exc}"
     raise SystemExit(
-        f"Missing {missing}. Install the RL dependencies with:\n"
+        f"{problem}. Install the RL dependencies with:\n"
         f"  python -m pip install -r requirements-rl.txt"
     ) from exc
 

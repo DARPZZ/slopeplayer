@@ -32,7 +32,8 @@ COPY . .
 COPY docker-entrypoint.sh /usr/local/bin/slope-entrypoint
 
 RUN chmod +x /usr/local/bin/slope-entrypoint \
-    && mkdir -p /app/models
+    && mkdir -p /app/models \
+    && grep -q -- '"--browser-capture-width"' slope_rl.py
 
 ENTRYPOINT ["/usr/local/bin/slope-entrypoint"]
 CMD ["train", "--url", "https://da.y8.com/games/slope", "--browser-channel", "bundled", "--instances", "1", "--steps", "100000", "--resume", "--device", "cpu"]

@@ -23,9 +23,10 @@ try:
     import numpy as np
     from pynput import keyboard
 except ImportError as exc:  # Give a more useful error than a raw traceback.
-    missing = getattr(exc, "name", "a required package")
+    missing = getattr(exc, "name", None)
+    problem = f"Missing {missing}" if missing else f"Could not load a dependency: {exc}"
     raise SystemExit(
-        f"Missing {missing}. Install the dependencies with:\n"
+        f"{problem}. Install the dependencies with:\n"
         f"  {sys.executable} -m pip install -r requirements.txt"
     ) from exc
 
