@@ -1,0 +1,34 @@
+services:
+  trainer:
+    build:
+      context: .
+      args:
+        TORCH_VERSION: ${TORCH_VERSION:-2.14.0}
+    init: true
+    shm_size: "2gb"
+    restart: "on-failure:3"
+    stop_grace_period: 2m
+    volumes:
+      - ./models:/app/models
+    command:
+      - train
+      - --url
+      - ${SLOPE_URL:-https://da.y8.com/games/slope}
+      - --browser-channel
+      - bundled
+      - --instances
+      - ${SLOPE_INSTANCES:-1}
+      - --steps
+      - ${SLOPE_STEPS:-100000}
+      - --checkpoint-every
+      - ${CHECKPOINT_EVERY:-10000}
+      - --fps
+      - ${SLOPE_FPS:-12}
+      - --resume
+      - --device
+      - cpu
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
