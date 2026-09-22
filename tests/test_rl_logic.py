@@ -20,6 +20,7 @@ from slope_rl import (
     SaveBestTrainingReward,
     _make_env,
     checkpoint_frequency,
+    heuristic_actions,
     install_stop_signal_handlers,
     parse_args,
     restart_key,
@@ -58,6 +59,12 @@ class RlUtilityTests(unittest.TestCase):
 
     def test_character_restart_key_is_preserved(self) -> None:
         self.assertEqual(restart_key("r"), "r")
+
+    def test_heuristic_warm_start_labels_steering_directions(self) -> None:
+        observations = np.zeros((3, 15), dtype=np.float32)
+        observations[:, 4] = (-0.5, 0.0, 0.5)
+        observations[:, 8] = 0.5
+        np.testing.assert_array_equal(heuristic_actions(observations), (0, 1, 2))
 
     def test_ppo_accepts_the_stacked_camera_observation(self) -> None:
         class FakeCameraEnvironment(gym.Env):
@@ -405,8 +412,52 @@ class RlUtilityTests(unittest.TestCase):
             self.assertEqual(observation.dtype, np.float32)
             self.assertTrue(np.all(observation >= -1.0))
             self.assertTrue(np.all(observation <= 1.0))
-            next_observation, *_ = environment.step(2)
+            next_observation, _, _, _, info = environment.step(2)
             self.assertEqual(next_observation[-1], 1.0)
+            self.assertGreaterEqual(info["browser_step_ms"], 0.0)
+            self.assertGreaterEqual(info["vision_ms"], 0.0)
+        finally:
+            environment.close()
+
+    def test_static_screen_requires_one_second_of_interval_checks(self) -> None:
+        environment = BrowserSlopeEnv(
+            region=None,
+            browser_url="https://example.com/game",
+            fps=20,
+        )
+        frame = np.zeros((84, 84, 3), dtype=np.uint8)
+        try:
+            _, detected = environment._static_screen_detected(frame)
+            self.assertFalse(detected)
+            for _ in range(environment.static_check_interval * 4 - 1):
+                _, detected = environment._static_screen_detected(frame)
+                self.assertFalse(detected)
+            motion, detected = environment._static_screen_detected(frame)
+            self.assertTrue(detected)
+            self.assertEqual(motion, 0.0)
+            self.assertEqual(environment.static_checks, 4)
+        finally:
+            environment.close()
+
+    def test_colour_changes_are_not_treated_as_a_static_screen(self) -> None:
+        environment = BrowserSlopeEnv(
+            region=None,
+            browser_url="https://example.com/game",
+            fps=20,
+        )
+        red = np.zeros((84, 84, 3), dtype=np.uint8)
+        red[:] = (0, 0, 255)
+        equal_brightness_green = np.zeros_like(red)
+        equal_brightness_green[:] = (0, 130, 0)
+        detected = False
+        try:
+            environment._static_screen_detected(red)
+            for index in range(environment.static_check_interval * 8):
+                frame = equal_brightness_green if index % 2 == 0 else red
+                motion, detected = environment._static_screen_detected(frame)
+                self.assertFalse(detected)
+            self.assertGreater(motion, environment.static_motion_threshold)
+            self.assertEqual(environment.static_checks, 0)
         finally:
             environment.close()
 

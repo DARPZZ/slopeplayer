@@ -88,7 +88,9 @@ class BrowserSlopeEnv(gym.Env):
         self.region = region
         self.frame_period = 1.0 / fps
         self.missing_track_limit = max(3, round(fps * 2 / 3))
-        self.static_screen_limit = max(5, fps)
+        self.static_check_interval = max(1, round(fps * 0.25))
+        self.static_required_checks = 4
+        self.static_motion_threshold = 0.20
         self.restart_button = restart_key(restart)
         self.restart_click = restart_click
         self.restart_wait = restart_wait
@@ -124,8 +126,10 @@ class BrowserSlopeEnv(gym.Env):
         self.mouse = mouse.Controller() if browser_url is None else None
         self.episode_step = 0
         self.low_track_frames = 0
-        self.still_frames = 0
-        self.previous_small: np.ndarray | None = None
+        self.static_checks = 0
+        self.static_reference: np.ndarray | None = None
+        self.static_reference_age = 0
+        self.last_screen_motion = 0.0
         self.previous_feature_ball: tuple[int, int] | None = None
         self.previous_feature_target: float | None = None
         self.last_step_at = 0.0
@@ -202,6 +206,32 @@ class BrowserSlopeEnv(gym.Env):
             return self._feature_observation(frame, result, direction)
         return self._camera_observation(frame)
 
+    def _static_screen_detected(self, current_small: np.ndarray) -> tuple[float, bool]:
+        """Compare colour snapshots far enough apart to reveal real game motion."""
+
+        if self.static_reference is None:
+            self.static_reference = current_small
+            self.static_reference_age = 0
+            return self.last_screen_motion, False
+
+        self.static_reference_age += 1
+        if self.static_reference_age < self.static_check_interval:
+            return self.last_screen_motion, False
+
+        self.last_screen_motion = float(
+            cv2.absdiff(current_small, self.static_reference).mean()
+        )
+        if self.last_screen_motion < self.static_motion_threshold:
+            self.static_checks += 1
+        else:
+            self.static_checks = 0
+        self.static_reference = current_small
+        self.static_reference_age = 0
+        return (
+            self.last_screen_motion,
+            self.static_checks >= self.static_required_checks,
+        )
+
     def _press_restart(self) -> None:
         if self.input is None or self.mouse is None:
             raise RuntimeError("Desktop restart controls are unavailable in URL mode")
@@ -241,8 +271,10 @@ class BrowserSlopeEnv(gym.Env):
         self.perception = Perception()
         self.episode_step = 0
         self.low_track_frames = 0
-        self.still_frames = 0
-        self.previous_small = None
+        self.static_checks = 0
+        self.static_reference = None
+        self.static_reference_age = 0
+        self.last_screen_motion = 0.0
         self.previous_feature_ball = None
         self.previous_feature_target = None
         self.last_step_at = time.perf_counter()
@@ -256,6 +288,7 @@ class BrowserSlopeEnv(gym.Env):
     def step(
         self, action: int
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+        step_started = time.perf_counter()
         direction = (-1, 0, 1)[int(action)]
         if self.browser_session is not None:
             frame = self.browser_session.advance(direction, self.frame_period)
@@ -269,21 +302,14 @@ class BrowserSlopeEnv(gym.Env):
                 time.sleep(delay)
             self.last_step_at = time.perf_counter()
             frame = self._capture()
+        browser_finished = time.perf_counter()
         result = self.perception.analyse(frame)
+        vision_finished = time.perf_counter()
         observation = self._observation(frame, result, direction)
         self.episode_step += 1
 
-        motion = 0.0
-        current_gray = cv2.resize(
-            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (84, 84), interpolation=cv2.INTER_AREA
-        )
-        if self.previous_small is not None:
-            motion = float(cv2.absdiff(current_gray, self.previous_small).mean())
-            if motion < 0.45:
-                self.still_frames += 1
-            else:
-                self.still_frames = max(0, self.still_frames - 3)
-        self.previous_small = current_gray
+        current_small = cv2.resize(frame, (84, 84), interpolation=cv2.INTER_AREA)
+        motion, static_screen = self._static_screen_detected(current_small)
 
         green_ratio = float(np.count_nonzero(result.green_mask)) / result.green_mask.size
         if green_ratio < 0.0025 or result.confidence < 0.006:
@@ -292,10 +318,9 @@ class BrowserSlopeEnv(gym.Env):
             self.low_track_frames = max(0, self.low_track_frames - 2)
 
         # Some retry screens remove the track, while Y8's Unity version can
-        # leave it visible behind the overlay. In the latter case the canvas is
-        # effectively static. Requiring consecutive frames avoids false deaths.
+        # leave it visible behind the overlay. Compare quarter-second snapshots
+        # so high capture rates do not make active frames look artificially still.
         missing_track = self.low_track_frames >= self.missing_track_limit
-        static_screen = self.still_frames >= self.static_screen_limit
         terminated = missing_track or static_screen
         truncated = self.episode_step >= self.max_episode_steps
 
@@ -312,8 +337,11 @@ class BrowserSlopeEnv(gym.Env):
             "green_ratio": green_ratio,
             "target_error": target_error,
             "screen_motion": motion,
-            "still_frames": self.still_frames,
+            "static_checks": self.static_checks,
+            "static_check_interval": self.static_check_interval,
             "episode_steps": self.episode_step,
+            "browser_step_ms": (browser_finished - step_started) * 1000,
+            "vision_ms": (vision_finished - browser_finished) * 1000,
         }
         if terminated or truncated:
             if self.keys is not None:
@@ -395,6 +423,94 @@ class SaveBestTrainingReward(BaseCallback):
             )
             temporary_metadata.replace(self.metadata_path)
         return True
+
+
+class PerformanceCallback(BaseCallback):
+    """Print a periodic breakdown of browser and vision throughput."""
+
+    def __init__(self, report_seconds: float = 60.0) -> None:
+        super().__init__()
+        self.report_seconds = report_seconds
+        self.last_report = time.monotonic()
+        self.steps = 0
+        self.browser_seconds = 0.0
+        self.vision_seconds = 0.0
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        self.steps += len(infos)
+        for info in infos:
+            self.browser_seconds += float(info.get("browser_step_ms", 0.0)) / 1000
+            self.vision_seconds += float(info.get("vision_ms", 0.0)) / 1000
+        now = time.monotonic()
+        elapsed = now - self.last_report
+        if elapsed >= self.report_seconds and self.steps:
+            print(
+                f"Performance: {self.steps / elapsed:.2f} steps/s | "
+                f"browser {self.browser_seconds * 1000 / self.steps:.0f} ms/step | "
+                f"vision {self.vision_seconds * 1000 / self.steps:.0f} ms/step",
+                flush=True,
+            )
+            self.last_report = now
+            self.steps = 0
+            self.browser_seconds = 0.0
+            self.vision_seconds = 0.0
+        return True
+
+
+def heuristic_actions(observations: np.ndarray) -> np.ndarray:
+    """Label compact observations with the proven proportional steering rule."""
+
+    error = observations[:, 4] * 0.70
+    derivative = (observations[:, 7] - observations[:, 5]) * 0.20
+    desired = 1.55 * error + 0.42 * derivative
+    dead_zone = np.where(observations[:, 8] > 0.08, 0.050, 0.085)
+    actions = np.ones(len(observations), dtype=np.int64)
+    actions[desired < -dead_zone] = 0
+    actions[desired > dead_zone] = 2
+    return actions
+
+
+def warm_start_feature_policy(model: PPO, samples: int = 8_192, epochs: int = 8) -> float:
+    """Teach a new feature policy sensible steering before PPO exploration."""
+
+    rng = np.random.default_rng(7)
+    observations = rng.uniform(-1.0, 1.0, size=(samples, 15)).astype(np.float32)
+    observations[:, 4] = np.clip(rng.normal(0.0, 0.45, samples), -1.0, 1.0)
+    observations[:, 5:8] = np.clip(
+        rng.normal(0.0, 0.25, size=(samples, 3)), -1.0, 1.0
+    )
+    observations[:, 8] = rng.uniform(0.0, 1.0, samples)
+    observations[:, 10] = rng.integers(0, 2, samples)
+    observations[:, 14] = rng.integers(-1, 2, samples)
+    observations[:, 2] = np.clip(
+        observations[:, 0] + observations[:, 4] * 0.70, -1.0, 1.0
+    )
+    observations[:, 3] = observations[:, 2]
+    actions = heuristic_actions(observations)
+
+    optimizer = torch.optim.Adam(model.policy.parameters(), lr=2e-3)
+    order = np.arange(samples)
+    model.policy.train()
+    for _ in range(epochs):
+        rng.shuffle(order)
+        for start in range(0, samples, 256):
+            indices = order[start : start + 256]
+            batch = torch.as_tensor(observations[indices], device=model.device)
+            labels = torch.as_tensor(actions[indices], device=model.device)
+            distribution = model.policy.get_distribution(batch).distribution
+            loss = torch.nn.functional.cross_entropy(distribution.logits, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    with torch.no_grad():
+        batch = torch.as_tensor(observations, device=model.device)
+        predicted = model.policy.get_distribution(batch).distribution.probs.argmax(dim=1)
+        accuracy = float((predicted.cpu().numpy() == actions).mean())
+    model.heuristic_warm_started = True
+    print(f"Feature policy heuristic warm start: {accuracy:.1%} steering accuracy", flush=True)
+    return accuracy
 
 
 def install_stop_signal_handlers(stop_event: threading.Event) -> None:
@@ -548,6 +664,10 @@ def train(args: argparse.Namespace) -> None:
                 device=args.device,
                 policy_kwargs=policy_kwargs,
             )
+        if args.observation == "features" and not getattr(
+            model, "heuristic_warm_started", False
+        ):
+            warm_start_feature_policy(model)
         checkpoint = CheckpointCallback(
             save_freq=checkpoint_frequency(args.checkpoint_every, args.instances),
             save_path=str(MODEL_DIR),
@@ -555,7 +675,9 @@ def train(args: argparse.Namespace) -> None:
         )
         best_path = model_path.with_name(f"{model_path.stem}_best")
         save_best = SaveBestTrainingReward(best_path)
-        callbacks = CallbackList([checkpoint, save_best, StopOnEmergencyKey(stop_event)])
+        callbacks = CallbackList(
+            [checkpoint, save_best, PerformanceCallback(), StopOnEmergencyKey(stop_event)]
+        )
         print("Training started. Press F9 at any time to stop and save.")
         model.learn(
             total_timesteps=args.steps,

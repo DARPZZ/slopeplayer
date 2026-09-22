@@ -218,6 +218,9 @@ then leave the pointer there for the entire run. The script clicks the current
 mouse position after every death. Keep the browser window in the same position
 while training. This mode also detects the static game-over canvas used by the
 Y8 Unity version, even when the green track remains visible behind the overlay.
+Static detection compares colour snapshots a quarter-second apart and requires
+about one second of confirmed stillness, preventing high-FPS gameplay with small
+frame-to-frame changes from being mistaken for a death screen.
 
 Resume learning from the saved model:
 
@@ -271,9 +274,11 @@ so stale Xvfb locks left by a failed restart no longer break the next attempt.
 The first build downloads bundled Chromium and CPU-only PyTorch. Defaults in
 `.env.example` train one game for 100,000 aggregate steps and resume
 `models/slope_ppo_features.zip` when it exists. The VPS profile uses the compact
-feature policy, an 8 Hz action cadence, a 640-pixel viewport, JPEG capture, and
-one PyTorch thread. These settings reduce software WebGL, screenshot, and neural
-network cost while preserving enough detail for the colour detector. Change
+feature policy, a 12 Hz action cadence, a 480-pixel viewport, JPEG capture, and
+one PyTorch thread. New feature policies receive a short synthetic warm start
+from the proven steering rule before PPO exploration begins. These settings
+reduce software WebGL, screenshot, and neural network cost while preserving
+enough detail for the colour detector. Change
 `SLOPE_INSTANCES`, `SLOPE_STEPS`, `SLOPE_FPS`, `SLOPE_CAPTURE_WIDTH`,
 `SLOPE_MODEL`, or `CHECKPOINT_EVERY` in `.env` as needed.
 
@@ -309,4 +314,6 @@ a two-vCPU host. Increase `SLOPE_INSTANCES` only while there is spare CPU and
 RAM; more workers can reduce throughput after the machine is saturated. PPO's
 logged `fps` is aggregate environment steps per wall-clock second, not the
 configured game cadence. Judge learning from the trend in `ep_len_mean` and
-`ep_rew_mean` over several rollouts.
+`ep_rew_mean` over several rollouts. A `Performance:` line is printed every
+minute with measured steps/second plus browser and vision milliseconds per step;
+this shows which part is limiting the VPS.

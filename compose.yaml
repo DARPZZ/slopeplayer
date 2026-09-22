@@ -27,7 +27,7 @@ services:
       - --observation
       - features
       - --browser-capture-width
-      - ${SLOPE_CAPTURE_WIDTH:-640}
+      - ${SLOPE_CAPTURE_WIDTH:-480}
       - --browser-screenshot-format
       - jpeg
       - --steps
@@ -35,7 +35,7 @@ services:
       - --checkpoint-every
       - ${CHECKPOINT_EVERY:-10000}
       - --fps
-      - ${SLOPE_FPS:-8}
+      - ${SLOPE_FPS:-12}
       - --resume
       - --device
       - cpu
