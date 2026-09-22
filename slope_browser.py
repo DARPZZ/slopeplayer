@@ -55,6 +55,8 @@ class PlaywrightSlopeSession:
         headless: bool = True,
         load_timeout: float = 120.0,
         realtime: bool = False,
+        capture_width: int = 640,
+        screenshot_format: str = "jpeg",
     ) -> None:
         self.url = normalize_game_url(url)
         self.worker_id = worker_id
@@ -62,6 +64,9 @@ class PlaywrightSlopeSession:
         self.browser_channel = browser_channel
         self.headless = headless
         self.realtime = realtime
+        self.capture_width = capture_width
+        self.capture_height = round(capture_width * 641 / 960)
+        self.screenshot_format = screenshot_format
         self.load_timeout_ms = max(1, round(load_timeout * 1000))
         self.operation_timeout_ms = 10_000
 
@@ -107,7 +112,7 @@ class PlaywrightSlopeSession:
                 ],
             )
             self.context = self.browser.new_context(
-                viewport={"width": 960, "height": 641},
+                viewport={"width": self.capture_width, "height": self.capture_height},
                 device_scale_factor=1,
                 locale="en-US",
             )
@@ -248,11 +253,17 @@ class PlaywrightSlopeSession:
     def _raw_frame(self) -> np.ndarray:
         assert self.page is not None
         box = self._canvas_box()
-        encoded = self.page.screenshot(
-            clip=box,
-            type="png",
-            timeout=self.operation_timeout_ms,
-        )
+        screenshot_options: dict[str, Any] = {
+            "clip": box,
+            "type": self.screenshot_format,
+            "timeout": self.operation_timeout_ms,
+        }
+        if self.screenshot_format == "jpeg":
+            # Lossy encoding is substantially cheaper than PNG in a software-
+            # rendered container. Quality 70 preserves the broad neon colour
+            # regions used by the detector while reducing encode/decode work.
+            screenshot_options["quality"] = 70
+        encoded = self.page.screenshot(**screenshot_options)
         frame = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None or frame.size == 0:
             raise BrowserSessionError("Chromium returned an empty canvas screenshot")

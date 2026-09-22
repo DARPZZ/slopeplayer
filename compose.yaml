@@ -10,6 +10,10 @@ services:
     stop_grace_period: 2m
     volumes:
       - ./models:/app/models
+    environment:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     command:
       - train
       - --url
@@ -18,12 +22,20 @@ services:
       - bundled
       - --instances
       - ${SLOPE_INSTANCES:-1}
+      - --model
+      - ${SLOPE_MODEL:-/app/models/slope_ppo_features}
+      - --observation
+      - features
+      - --browser-capture-width
+      - ${SLOPE_CAPTURE_WIDTH:-640}
+      - --browser-screenshot-format
+      - jpeg
       - --steps
       - ${SLOPE_STEPS:-100000}
       - --checkpoint-every
       - ${CHECKPOINT_EVERY:-10000}
       - --fps
-      - ${SLOPE_FPS:-12}
+      - ${SLOPE_FPS:-8}
       - --resume
       - --device
       - cpu

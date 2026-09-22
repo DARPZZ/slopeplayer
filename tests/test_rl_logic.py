@@ -3,8 +3,11 @@ import threading
 import unittest
 from contextlib import redirect_stderr
 from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
+import cv2
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -14,6 +17,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack
 from slope_browser import PlaywrightSlopeSession, normalize_game_url, playwright_key_names
 from slope_rl import (
     BrowserSlopeEnv,
+    SaveBestTrainingReward,
     _make_env,
     checkpoint_frequency,
     install_stop_signal_handlers,
@@ -32,6 +36,25 @@ class RlUtilityTests(unittest.TestCase):
             handlers = {call.args[0]: call.args[1] for call in register.call_args_list}
             handlers[signal.SIGTERM](signal.SIGTERM, None)
         self.assertTrue(stop_event.is_set())
+
+    def test_best_training_reward_is_saved_separately(self) -> None:
+        with TemporaryDirectory() as directory:
+            save_path = Path(directory) / "test_best"
+            callback = SaveBestTrainingReward(
+                save_path=save_path, window=3, minimum_episodes=2
+            )
+            callback.model = Mock()
+            callback.locals = {"infos": [{"episode": {"r": 1.0}}]}
+            self.assertTrue(callback._on_step())
+            callback.model.save.assert_not_called()
+            callback.locals = {"infos": [{"episode": {"r": 3.0}}]}
+            with patch("builtins.print"):
+                self.assertTrue(callback._on_step())
+            callback.model.save.assert_called_once_with(save_path)
+
+            resumed = SaveBestTrainingReward(save_path, window=3, minimum_episodes=2)
+            self.assertEqual(resumed.best_mean_reward, 2.0)
+            self.assertEqual(list(resumed.rewards), [1.0, 3.0])
 
     def test_character_restart_key_is_preserved(self) -> None:
         self.assertEqual(restart_key("r"), "r")
@@ -104,6 +127,10 @@ class RlUtilityTests(unittest.TestCase):
         )
         self.assertEqual(args.instances, 4)
         self.assertEqual(args.browser_channel, "chrome")
+        self.assertEqual(args.observation, "features")
+        self.assertEqual(args.browser_capture_width, 640)
+        self.assertEqual(args.browser_screenshot_format, "jpeg")
+        self.assertEqual(args.torch_threads, 1)
         self.assertFalse(args.headed)
         self.assertEqual(args.visible_instances, 0)
 
@@ -340,6 +367,7 @@ class RlUtilityTests(unittest.TestCase):
             region=None,
             browser_url="https://example.com/game",
             restart_wait=0,
+            observation_mode="camera",
         )
         session = FakeSession()
         environment.browser_session = session
@@ -349,6 +377,66 @@ class RlUtilityTests(unittest.TestCase):
         self.assertEqual(session.directions, [1])
         environment.close()
         self.assertTrue(session.closed)
+
+    def test_feature_observation_is_compact_normalized_and_temporal(self) -> None:
+        environment = BrowserSlopeEnv(
+            region=None,
+            browser_url="https://example.com/game",
+            restart_wait=0,
+            observation_mode="features",
+        )
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        frame[220:360, 100:540] = (0, 255, 0)
+
+        class FakeSession:
+            def reset(self, reason, restart_wait):
+                return frame
+
+            def advance(self, direction, frame_period):
+                return frame
+
+            def close(self):
+                pass
+
+        environment.browser_session = FakeSession()
+        try:
+            observation, _ = environment.reset()
+            self.assertEqual(observation.shape, (15,))
+            self.assertEqual(observation.dtype, np.float32)
+            self.assertTrue(np.all(observation >= -1.0))
+            self.assertTrue(np.all(observation <= 1.0))
+            next_observation, *_ = environment.step(2)
+            self.assertEqual(next_observation[-1], 1.0)
+        finally:
+            environment.close()
+
+    def test_jpeg_capture_uses_reduced_viewport_and_quality(self) -> None:
+        session = PlaywrightSlopeSession(
+            "https://example.com/game",
+            worker_id=0,
+            layout="arrows",
+            capture_width=640,
+            screenshot_format="jpeg",
+        )
+        session.page = Mock()
+        session.canvas = Mock()
+        session.canvas.bounding_box.return_value = {
+            "x": 0,
+            "y": 0,
+            "width": 640,
+            "height": 360,
+        }
+        encoded = cv2.imencode(".jpg", np.zeros((360, 640, 3), dtype=np.uint8))[1]
+        session.page.screenshot.return_value = encoded.tobytes()
+        frame = session._raw_frame()
+        self.assertEqual(session.capture_height, 427)
+        self.assertEqual(frame.shape, (360, 640, 3))
+        session.page.screenshot.assert_called_once_with(
+            clip=session.canvas.bounding_box.return_value,
+            type="jpeg",
+            timeout=session.operation_timeout_ms,
+            quality=70,
+        )
 
 
 if __name__ == "__main__":

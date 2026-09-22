@@ -191,8 +191,12 @@ computer must remain awake, the game must stay focused, and the window must not
 move. Desktop mode supports only one instance; `--instances` greater than one
 requires `--url`.
 
-It uses screenshots as observations, rewards staying alive and aligned with the
-detected track, gives a penalty for crashing, and presses Space to restart.
+By default it gives PPO 15 normalized features already extracted by the colour
+detector: ball and target positions, their motion, track confidence/density,
+obstacle geometry, and the last steering direction. This trains a small MLP
+much faster on a CPU than the old stacked-image CNN. It rewards staying alive
+and aligned with the detected track, gives a penalty for crashing, and presses
+Space to restart.
 Pressing **F9** has the same safe-stop-and-save behavior described above.
 
 If your game restarts with Enter or R, use one of these:
@@ -227,11 +231,12 @@ Run the trained policy without further learning:
 python slope_rl.py play
 ```
 
-The agent sees four consecutive 84×84 RGB frames and chooses left, straight, or
-right. PPO learns the policy; the existing colour detector supplies reward and
-game-over signals only. Because Slope websites differ, use the restart-key option
-that matches your version and rerun region setup after moving the browser when
-using legacy desktop mode.
+The agent chooses left, straight, or right. To train the original image policy,
+pass `--observation camera`; it sees four consecutive 84×84 RGB frames. Camera
+and feature checkpoints are not interchangeable, so also use a separate model
+path, such as `--model models/slope_ppo_camera`. Because Slope websites differ,
+use the restart-key option that matches your version and rerun region setup
+after moving the browser when using legacy desktop mode.
 
 ## Docker Compose on a CPU VPS
 
@@ -250,10 +255,16 @@ docker compose logs -f trainer
 
 The first build downloads bundled Chromium and CPU-only PyTorch. Defaults in
 `.env.example` train one game for 100,000 aggregate steps and resume
-`models/slope_ppo.zip` when it exists. Change
-`SLOPE_INSTANCES`, `SLOPE_STEPS`, `SLOPE_FPS`, or `CHECKPOINT_EVERY` in `.env`
-as needed. To continue a model trained elsewhere, copy `slope_ppo.zip` into the
-VPS repository's `models/` directory before starting the service.
+`models/slope_ppo_features.zip` when it exists. The VPS profile uses the compact
+feature policy, an 8 Hz action cadence, a 640-pixel viewport, JPEG capture, and
+one PyTorch thread. These settings reduce software WebGL, screenshot, and neural
+network cost while preserving enough detail for the colour detector. Change
+`SLOPE_INSTANCES`, `SLOPE_STEPS`, `SLOPE_FPS`, `SLOPE_CAPTURE_WIDTH`,
+`SLOPE_MODEL`, or `CHECKPOINT_EVERY` in `.env` as needed.
+
+Old `slope_ppo.zip` camera checkpoints cannot be resumed by this feature policy.
+Keep them under a different name and use `--observation camera` when playing or
+continuing them.
 
 Confirm that the container has the CPU-only PyTorch build while it is running:
 
@@ -273,6 +284,14 @@ models and checkpoints survive image rebuilds and container replacement. A
 normally completed training run remains stopped; run `docker compose up -d`
 again to resume for another configured number of steps.
 
+The latest resumable policy is `models/slope_ppo_features.zip`. After ten
+episodes, training also maintains `models/slope_ppo_features_best.zip` whenever
+the rolling mean episode reward reaches a new high. Use the `_best` file for
+playback and keep the regular file for continuing the latest training state.
+
 The default image uses CPU-only PyTorch 2.14. Start with one browser instance on
-a small VPS. Increase `SLOPE_INSTANCES` only while there is spare CPU and RAM;
-more workers can reduce throughput after the machine is saturated.
+a two-vCPU host. Increase `SLOPE_INSTANCES` only while there is spare CPU and
+RAM; more workers can reduce throughput after the machine is saturated. PPO's
+logged `fps` is aggregate environment steps per wall-clock second, not the
+configured game cadence. Judge learning from the trend in `ep_len_mean` and
+`ep_rew_mean` over several rollouts.
