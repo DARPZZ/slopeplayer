@@ -44,6 +44,33 @@ class Uint8VectorExtractor(BaseFeaturesExtractor):
         return flattened / 255.0
 
 
+DEFAULT_EXPLORATION_STEPS = 150_000
+
+
+class SlopeQRDQN(QRDQN):
+    """QR-DQN whose exploration anneals over absolute timesteps.
+
+    SB3 anneals epsilon over a fraction of the ``total_timesteps`` given to
+    each ``learn()`` call, and a resume adds that request to the steps already
+    taken.  Every resume therefore stretches the schedule and raises epsilon
+    again.  ``exploration_steps`` is saved with the model, so the schedule set
+    at the start of a run survives any number of resumes.
+    """
+
+    # Class-level fallback for checkpoints saved before this attribute existed.
+    exploration_steps: int = DEFAULT_EXPLORATION_STEPS
+
+    def exploration_at(self, timesteps: int) -> float:
+        progress = min(1.0, timesteps / max(1, self.exploration_steps))
+        start, end = self.exploration_initial_eps, self.exploration_final_eps
+        return start + progress * (end - start)
+
+    def _on_step(self) -> None:
+        super()._on_step()
+        self.exploration_rate = self.exploration_at(self.num_timesteps)
+        self.logger.record("rollout/exploration_rate", self.exploration_rate)
+
+
 @dataclass(frozen=True)
 class CheckpointPaths:
     """Files that together make one resumable off-policy checkpoint."""
@@ -65,10 +92,17 @@ def checkpoint_paths(path: str | Path) -> CheckpointPaths:
     return CheckpointPaths(model=model_path, replay_buffer=replay_path)
 
 
-def build_qrdqn(env: Any, device: str = "auto", seed: int = 7) -> QRDQN:
+def build_qrdqn(
+    env: Any,
+    device: str = "auto",
+    seed: int = 7,
+    exploration_steps: int = DEFAULT_EXPLORATION_STEPS,
+) -> SlopeQRDQN:
     """Build the sample-efficient default learner for Slope."""
 
-    return QRDQN(
+    if exploration_steps < 1:
+        raise ValueError("exploration_steps must be positive")
+    model = SlopeQRDQN(
         "MlpPolicy",
         env,
         learning_rate=1e-4,
@@ -82,7 +116,7 @@ def build_qrdqn(env: Any, device: str = "auto", seed: int = 7) -> QRDQN:
         target_update_interval=5_000,
         exploration_initial_eps=1.0,
         exploration_final_eps=0.03,
-        exploration_fraction=0.30,
+        # SlopeQRDQN replaces SB3's relative schedule; see exploration_steps.
         # SB3 2.9's NStepReplayBuffer rejects its memory-optimized layout.
         optimize_memory_usage=False,
         # Gymnasium truncations are not deaths. Bootstrap through the 180-second
@@ -99,6 +133,8 @@ def build_qrdqn(env: Any, device: str = "auto", seed: int = 7) -> QRDQN:
         device=device,
         seed=seed,
     )
+    model.exploration_steps = int(exploration_steps)
+    return model
 
 
 def save_training_state(model: Any, path: str | Path) -> CheckpointPaths:
@@ -150,7 +186,7 @@ def load_training_state(
             "Cannot resume training without both the model and replay buffer; "
             f"missing: {listed}"
         )
-    model = QRDQN.load(paths.model, env=env, device=device)
+    model = SlopeQRDQN.load(paths.model, env=env, device=device)
     model.load_replay_buffer(paths.replay_buffer)
     return model
 
@@ -162,12 +198,19 @@ def create_or_resume_qrdqn(
     resume: bool,
     device: str = "auto",
     seed: int = 7,
-) -> QRDQN:
-    """Create a fresh learner or require and restore a complete checkpoint."""
+    exploration_steps: int = DEFAULT_EXPLORATION_STEPS,
+) -> SlopeQRDQN:
+    """Create a fresh learner or require and restore a complete checkpoint.
+
+    ``exploration_steps`` applies only to a fresh learner; a resumed one keeps
+    the schedule stored in its checkpoint.
+    """
 
     if resume:
         return load_training_state(env, path, device=device)
-    return build_qrdqn(env, device=device, seed=seed)
+    return build_qrdqn(
+        env, device=device, seed=seed, exploration_steps=exploration_steps
+    )
 
 
 class TrainingProgressCallback(BaseCallback):

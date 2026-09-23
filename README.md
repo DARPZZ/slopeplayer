@@ -99,7 +99,9 @@ Resume the latest training state with:
 python slope.py train --model runs/slope_qrdqn --steps 500000 --resume --device cuda
 ```
 
-On resume, `--steps 500000` means 500,000 additional transitions. The command
+On resume, `--steps 500000` means 500,000 additional transitions. The
+exploration schedule is fixed when the run starts and is not affected by
+the resume `--steps` value. The command
 fails deliberately if either the latest `.zip` or `.replay.pkl` is missing.
 The `_best.zip` model has no replay buffer and cannot be used with `--resume`.
 Copy or back up each latest model/replay pair together.
@@ -146,7 +148,8 @@ The most useful values are:
 - `ep_rew_mean`: exploratory reward including the death and action-change
   penalties. It should rise with survival but is not the selection metric.
 - `exploration_rate`: random-action probability. It anneals from 1.0 to 0.03
-  over the first 30% of the planned run.
+  over the first 30% of the fresh run's `--steps`. That length is stored in
+  the checkpoint, so resuming never raises exploration again.
 - `loss`: the QR-DQN optimization loss. It should remain finite, but lower is
   not automatically better gameplay.
 - `throughput` or `fps`: collected transitions per wall-clock second, not the

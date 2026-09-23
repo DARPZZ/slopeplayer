@@ -11,7 +11,6 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-from sb3_contrib import QRDQN
 from stable_baselines3.common.callbacks import CallbackList
 
 from .browser import BrowserConfig
@@ -19,6 +18,7 @@ from .env import EnvConfig, SlopeEnv
 from .evaluation import BestModelCallback, best_checkpoint_paths
 from .learner import (
     CheckpointPaths,
+    SlopeQRDQN,
     TrainingProgressCallback,
     checkpoint_paths,
     create_or_resume_qrdqn,
@@ -29,6 +29,7 @@ from .learner import (
 
 DEFAULT_URL = "https://da.y8.com/games/slope"
 DEFAULT_CHECKPOINT = Path("runs/slope_qrdqn")
+EXPLORATION_FRACTION = 0.30
 
 
 def prepare_training_artifacts(
@@ -150,7 +151,7 @@ def train(args: argparse.Namespace) -> None:
 
     print(cuda_summary(), flush=True)
     env = make_env(args, headless=not args.headed)
-    model: QRDQN | None = None
+    model: SlopeQRDQN | None = None
     try:
         model = create_or_resume_qrdqn(
             env,
@@ -158,6 +159,9 @@ def train(args: argparse.Namespace) -> None:
             resume=args.resume,
             device=args.device,
             seed=args.seed,
+            # Anneal over the first 30% of the planned run. Stored in the
+            # checkpoint, so later resumes keep this schedule.
+            exploration_steps=max(1, round(args.steps * EXPLORATION_FRACTION)),
         )
         progress = TrainingProgressCallback(
             args.model,
@@ -205,11 +209,11 @@ def train(args: argparse.Namespace) -> None:
             raise pending_error
 
 
-def load_play_model(path: str | Path, env: SlopeEnv, device: str) -> QRDQN:
+def load_play_model(path: str | Path, env: SlopeEnv, device: str) -> SlopeQRDQN:
     load_path = model_file(path)
     if not load_path.is_file():
         raise SystemExit(f"Model not found: {load_path}")
-    return QRDQN.load(load_path, env=env, device=device)
+    return SlopeQRDQN.load(load_path, env=env, device=device)
 
 
 def play(args: argparse.Namespace) -> None:

@@ -542,6 +542,47 @@ class BrowserTests(unittest.TestCase):
         self.assertFalse(browser.started)
         self.assertFalse(browser.clock_frozen)
 
+    def test_concurrent_browsers_share_one_playwright_driver(self) -> None:
+        # The sync API cannot start a second driver on the same thread, so the
+        # training and evaluation browsers must share one.
+        driver = Mock()
+        driver.chromium.launch.return_value.new_context.return_value.new_page.return_value.goto.return_value = None
+        starter = Mock()
+        starter.return_value.start.return_value = driver
+        page_setup = (
+            "_promote_y8_embed",
+            "_discover_canvas",
+            "_wait_for_unity_loader",
+            "_close_extra_pages",
+            "_dismiss_consent",
+            "_wait_for_menu_pixels",
+            "_freeze_clock",
+        )
+
+        def launched() -> SlopeBrowser:
+            browser = make_browser()
+            for name in page_setup:
+                setattr(browser, name, Mock())
+            browser._launch()
+            return browser
+
+        with patch("playwright.sync_api.sync_playwright", starter):
+            training = launched()
+            evaluation = launched()
+            starter.return_value.start.assert_called_once_with()
+            self.assertIs(training.playwright, driver)
+            self.assertIs(evaluation.playwright, driver)
+
+            evaluation.close()
+            driver.stop.assert_not_called()
+            training.close()
+            driver.stop.assert_called_once_with()
+
+            # A browser launched after the last one closed starts a new driver.
+            late = launched()
+            self.assertEqual(starter.return_value.start.call_count, 2)
+            late.close()
+
 
 if __name__ == "__main__":
     unittest.main()

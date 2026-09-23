@@ -14,6 +14,7 @@ from sb3_contrib import QRDQN
 from slope_core.learner import (
     EvaluationResult,
     TrainingProgressCallback,
+    SlopeQRDQN,
     Uint8VectorExtractor,
     build_qrdqn,
     checkpoint_paths,
@@ -50,9 +51,11 @@ class TinyEpisodeEnv(gym.Env[np.ndarray, int]):
 class LearnerTests(unittest.TestCase):
     def test_build_qrdqn_uses_sample_efficient_configuration(self) -> None:
         env = TinyEpisodeEnv([1])
-        sentinel = object()
-        with patch("slope_core.learner.QRDQN", return_value=sentinel) as qrdqn:
-            result = build_qrdqn(env, device="cuda", seed=19)
+        sentinel = Mock()
+        with patch("slope_core.learner.SlopeQRDQN", return_value=sentinel) as qrdqn:
+            result = build_qrdqn(
+                env, device="cuda", seed=19, exploration_steps=12_345
+            )
 
         self.assertIs(result, sentinel)
         self.assertEqual(qrdqn.call_args.args[0], "MlpPolicy")
@@ -68,7 +71,6 @@ class LearnerTests(unittest.TestCase):
         self.assertEqual(kwargs["target_update_interval"], 5_000)
         self.assertEqual(kwargs["exploration_initial_eps"], 1.0)
         self.assertEqual(kwargs["exploration_final_eps"], 0.03)
-        self.assertEqual(kwargs["exploration_fraction"], 0.30)
         self.assertFalse(kwargs["optimize_memory_usage"])
         self.assertEqual(
             kwargs["replay_buffer_kwargs"], {"handle_timeout_termination": True}
@@ -80,6 +82,7 @@ class LearnerTests(unittest.TestCase):
         self.assertEqual(policy_kwargs["net_arch"], [512, 512])
         self.assertEqual(kwargs["device"], "cuda")
         self.assertEqual(kwargs["seed"], 19)
+        self.assertEqual(sentinel.exploration_steps, 12_345)
 
     def test_build_qrdqn_constructs_real_model(self) -> None:
         model = build_qrdqn(TinyEpisodeEnv([1]), device="cpu", seed=3)
@@ -96,6 +99,37 @@ class LearnerTests(unittest.TestCase):
             self.assertIn(int(np.asarray(action).reshape(-1)[0]), (0, 1, 2))
         finally:
             model.get_env().close()
+
+    def test_exploration_schedule_survives_save_and_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = build_qrdqn(
+                TinyEpisodeEnv([1]), device="cpu", seed=5, exploration_steps=1_000
+            )
+            path = Path(directory) / "model.zip"
+            try:
+                self.assertAlmostEqual(model.exploration_at(0), 1.0)
+                self.assertAlmostEqual(model.exploration_at(500), 0.515)
+                self.assertAlmostEqual(model.exploration_at(5_000), 0.03)
+                model.save(path)
+            finally:
+                model.get_env().close()
+            loaded = SlopeQRDQN.load(
+                path, env=TinyEpisodeEnv([1_000]), device="cpu"
+            )
+            try:
+                self.assertEqual(loaded.exploration_steps, 1_000)
+                # A resumed learn() with a large new budget must not re-raise
+                # epsilon: it depends only on absolute timesteps.
+                loaded.num_timesteps = 500
+                loaded.learn(total_timesteps=10, reset_num_timesteps=False)
+                self.assertGreaterEqual(loaded.num_timesteps, 510)
+                self.assertAlmostEqual(
+                    loaded.exploration_rate,
+                    loaded.exploration_at(loaded.num_timesteps),
+                )
+                self.assertLess(loaded.exploration_rate, loaded.exploration_at(500))
+            finally:
+                loaded.get_env().close()
 
     def test_uint8_extractor_dequantizes_to_unit_interval(self) -> None:
         observation_space = spaces.Box(0, 255, shape=(4,), dtype=np.uint8)
@@ -174,7 +208,7 @@ class LearnerTests(unittest.TestCase):
             paths.model.write_bytes(b"model")
             paths.replay_buffer.write_bytes(b"replay")
             loaded = Mock()
-            with patch("slope_core.learner.QRDQN.load", return_value=loaded) as load:
+            with patch("slope_core.learner.SlopeQRDQN.load", return_value=loaded) as load:
                 result = load_training_state(
                     TinyEpisodeEnv([1]), root / "agent", device="cpu"
                 )
@@ -191,7 +225,9 @@ class LearnerTests(unittest.TestCase):
                 env, "does-not-exist", resume=False, device="cpu", seed=23
             )
         self.assertIs(result, fresh)
-        build.assert_called_once_with(env, device="cpu", seed=23)
+        build.assert_called_once_with(
+            env, device="cpu", seed=23, exploration_steps=150_000
+        )
 
     def test_deterministic_evaluation_returns_lengths_rewards_and_rank(self) -> None:
         env = TinyEpisodeEnv([3, 5, 4, 8])

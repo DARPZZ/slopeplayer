@@ -68,6 +68,38 @@ class BrowserError(RuntimeError):
     """Raised when the game browser cannot provide a valid transition."""
 
 
+# Playwright's sync API permits only one started instance per thread; a second
+# ``sync_playwright().start()`` fails while the first is running.  Training and
+# its periodic evaluation each own a browser, so both launch from one shared,
+# reference-counted driver that stops only after the last browser closes.
+_shared_playwright: Any | None = None
+_shared_playwright_users = 0
+
+
+def _acquire_playwright() -> Any:
+    global _shared_playwright, _shared_playwright_users
+    if _shared_playwright is None:
+        from playwright.sync_api import sync_playwright
+
+        _shared_playwright = sync_playwright().start()
+        _shared_playwright_users = 0
+    _shared_playwright_users += 1
+    return _shared_playwright
+
+
+def _release_playwright(instance: Any) -> None:
+    global _shared_playwright, _shared_playwright_users
+    if instance is not _shared_playwright:
+        # Not the shared driver (already stopped, or supplied directly).
+        instance.stop()
+        return
+    _shared_playwright_users -= 1
+    if _shared_playwright_users <= 0:
+        _shared_playwright = None
+        _shared_playwright_users = 0
+        instance.stop()
+
+
 def normalize_game_url(url: str) -> str:
     """Convert a public/localized Y8 game page to its stable embed URL."""
 
@@ -158,7 +190,7 @@ class SlopeBrowser:
         if self.page is not None:
             return
         try:
-            from playwright.sync_api import sync_playwright
+            import playwright.sync_api  # noqa: F401
         except ImportError as exc:
             raise BrowserError(
                 "Playwright is required. Install the project dependencies and run "
@@ -166,7 +198,7 @@ class SlopeBrowser:
             ) from exc
 
         try:
-            self.playwright = sync_playwright().start()
+            self.playwright = _acquire_playwright()
             self.browser = self.playwright.chromium.launch(
                 channel=self.playwright_channel,
                 headless=self.config.headless,
@@ -937,7 +969,7 @@ class SlopeBrowser:
             pass
         try:
             if self.playwright is not None:
-                self.playwright.stop()
+                _release_playwright(self.playwright)
         except Exception:
             pass
         finally:
