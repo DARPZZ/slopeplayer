@@ -3,44 +3,48 @@ services:
     build:
       context: .
       args:
-        TORCH_VERSION: ${TORCH_VERSION:-2.14.0}
+        TORCH_VERSION: ${TORCH_VERSION:-2.8.0}
     init: true
     shm_size: "2gb"
     restart: "on-failure:3"
-    stop_grace_period: 2m
+    stop_grace_period: 3m
     volumes:
-      - ./models:/app/models
+      - ./runs:/app/runs
+      - ./artifacts:/app/artifacts
     environment:
-      OMP_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
+      SLOPE_AUTO_RESUME: "1"
+      OMP_NUM_THREADS: ${SLOPE_TORCH_THREADS:-1}
+      MKL_NUM_THREADS: ${SLOPE_TORCH_THREADS:-1}
+      OPENBLAS_NUM_THREADS: ${SLOPE_TORCH_THREADS:-1}
     command:
       - train
       - --url
       - ${SLOPE_URL:-https://da.y8.com/games/slope}
       - --browser-channel
       - bundled
-      - --instances
-      - ${SLOPE_INSTANCES:-1}
       - --model
-      - ${SLOPE_MODEL:-/app/models/slope_ppo_features}
-      - --observation
-      - features
-      - --browser-capture-width
-      - ${SLOPE_CAPTURE_WIDTH:-480}
-      - --browser-screenshot-format
-      - jpeg
+      - /app/runs/${SLOPE_MODEL_NAME:-slope_qrdqn}
       - --steps
-      - ${SLOPE_STEPS:-100000}
-      - --checkpoint-every
-      - ${CHECKPOINT_EVERY:-10000}
+      - ${SLOPE_STEPS:-500000}
       - --fps
       - ${SLOPE_FPS:-12}
-      - --resume
+      - --capture-width
+      - ${SLOPE_CAPTURE_WIDTH:-480}
       - --device
-      - cpu
+      - ${SLOPE_DEVICE:-cpu}
+      - --torch-threads
+      - ${SLOPE_TORCH_THREADS:-1}
+      - --report-every
+      - ${SLOPE_REPORT_EVERY:-100}
+      - --save-every
+      - ${SLOPE_SAVE_EVERY:-50000}
+      - --eval-every
+      - ${SLOPE_EVAL_EVERY:-50000}
+      - --eval-episodes
+      - ${SLOPE_EVAL_EPISODES:-10}
+      - --headless
     logging:
       driver: json-file
       options:
-        max-size: "10m"
+        max-size: "20m"
         max-file: "3"

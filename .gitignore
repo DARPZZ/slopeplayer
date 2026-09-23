@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
-slope_ai_config.json
-models/
+.pytest_cache/
+.venv/
 .env
+runs/
+artifacts/
+playwright-report/

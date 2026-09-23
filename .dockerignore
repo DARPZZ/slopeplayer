@@ -4,5 +4,7 @@
 .venv
 __pycache__
 *.py[cod]
-models
-tests
+.pytest_cache
+playwright-report
+runs
+artifacts

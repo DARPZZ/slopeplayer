@@ -1,0 +1,25 @@
+[project]
+name = "slope-rl"
+version = "2.0.0"
+description = "Visual reinforcement learning for browser Slope"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0,<3",
+    "opencv-python>=4.10,<5",
+    "gymnasium>=1.3,<2",
+    "stable-baselines3>=2.9,<3",
+    "sb3-contrib>=2.9,<3",
+    "torch>=2.8,<3",
+    "playwright>=1.63,<2",
+]
+
+[project.scripts]
+slope-rl = "slope_core.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["slope_core*"]
+
