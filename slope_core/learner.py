@@ -26,6 +26,10 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from .vision import FRAME_SHAPE
 
+# NNPACK fails to initialize on CPUs it does not support (common in containers)
+# and warns on every convolution before falling back to the default kernel.
+torch.backends.nnpack.set_flags(False)
+
 
 class FrameStackExtractor(BaseFeaturesExtractor):
     """CNN over the stacked frame images, joined with the recent actions.
