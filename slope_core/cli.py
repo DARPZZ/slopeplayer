@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,7 @@ import cv2
 import numpy as np
 import torch
 from stable_baselines3.common.callbacks import CallbackList
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
 from .browser import BrowserConfig
 from .env import EnvConfig, SlopeEnv
@@ -29,7 +33,9 @@ from .learner import (
 
 DEFAULT_URL = "https://da.y8.com/games/slope"
 DEFAULT_CHECKPOINT = Path("runs/slope_qrdqn")
-EXPLORATION_FRACTION = 0.30
+# Random play dies within seconds and every death costs a slow browser reset,
+# so exploration is annealed over the first 10% of a fresh run.
+EXPLORATION_FRACTION = 0.10
 
 
 def prepare_training_artifacts(
@@ -63,16 +69,19 @@ def make_env(
     *,
     headless: bool,
     max_episode_seconds: int | None = None,
+    worker_id: int = 0,
 ) -> SlopeEnv:
     width = args.capture_width
     browser = BrowserConfig(
         url=args.url,
+        worker_id=worker_id,
         channel=args.browser_channel,
         headless=headless,
         key_layout=args.keys,
         viewport_width=width,
         viewport_height=round(width * 2 / 3),
         screenshot_format=args.screenshot_format,
+        cdp_url=args.cdp_url,
     )
     environment = EnvConfig(
         fps=args.fps,
@@ -80,6 +89,38 @@ def make_env(
         max_episode_seconds=max_episode_seconds or args.episode_seconds,
     )
     return SlopeEnv(browser_config=browser, config=environment)
+
+
+def _worker_env(args: argparse.Namespace, worker_id: int) -> SlopeEnv:
+    """Build one training browser inside its own worker process."""
+
+    # Ctrl+C reaches every process in the console.  Only the trainer handles
+    # it, so a worker never dies mid-step before its browser is closed.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    return make_env(args, headless=not args.headed, worker_id=worker_id)
+
+
+def make_training_env(args: argparse.Namespace) -> Any:
+    """One in-process browser, or ``--envs`` browsers in worker processes."""
+
+    if args.envs == 1:
+        return make_env(args, headless=not args.headed)
+    workers = [functools.partial(_worker_env, args, index) for index in range(args.envs)]
+    return VecMonitor(SubprocVecEnv(workers))
+
+
+def close_training_env(env: Any, timeout_s: float = 60.0) -> None:
+    """Close training browsers without letting a stuck worker hang shutdown."""
+
+    if not isinstance(env, VecMonitor):
+        env.close()
+        return
+    closer = threading.Thread(target=env.close, daemon=True)
+    closer.start()
+    closer.join(timeout_s)
+    for process in env.venv.processes:
+        if process.is_alive():
+            process.terminate()
 
 
 def model_file(path: str | Path) -> Path:
@@ -123,8 +164,13 @@ def doctor(args: argparse.Namespace) -> None:
                 cv2.imwrite(
                     str(diagnostic_directory / f"{label}_final.png"), env._last_frame
                 )
+            outcome = (
+                f"death detected ({info.get('death_signal', 'unknown')})"
+                if terminated
+                else "time limit"
+            )
             print(
-                f"Doctor {label}: {'death detected' if terminated else 'time limit'} "
+                f"Doctor {label}: {outcome} "
                 f"after {steps / args.fps:.2f}s | {steps / elapsed:.2f} steps/s | "
                 f"death_confidence={info.get('game_over_confidence', 0.0):.3f}",
                 flush=True,
@@ -150,7 +196,9 @@ def train(args: argparse.Namespace) -> None:
     )
 
     print(cuda_summary(), flush=True)
-    env = make_env(args, headless=not args.headed)
+    if args.envs > 1:
+        print(f"Starting {args.envs} browsers...", flush=True)
+    env = make_training_env(args)
     model: SlopeQRDQN | None = None
     try:
         model = create_or_resume_qrdqn(
@@ -159,8 +207,6 @@ def train(args: argparse.Namespace) -> None:
             resume=args.resume,
             device=args.device,
             seed=args.seed,
-            # Anneal over the first 30% of the planned run. Stored in the
-            # checkpoint, so later resumes keep this schedule.
             exploration_steps=max(1, round(args.steps * EXPLORATION_FRACTION)),
         )
         progress = TrainingProgressCallback(
@@ -174,7 +220,7 @@ def train(args: argparse.Namespace) -> None:
         if args.eval_every > 0:
             callbacks.append(
                 BestModelCallback(
-                    lambda: make_env(args, headless=True),
+                    lambda: make_env(args, headless=True, worker_id=args.envs),
                     args.model,
                     eval_every=args.eval_every,
                     episodes=args.eval_episodes,
@@ -204,7 +250,7 @@ def train(args: argparse.Namespace) -> None:
                     flush=True,
                 )
         finally:
-            env.close()
+            close_training_env(env)
         if pending_error is not None and not isinstance(pending_error, KeyboardInterrupt):
             raise pending_error
 
@@ -218,7 +264,7 @@ def load_play_model(path: str | Path, env: SlopeEnv, device: str) -> SlopeQRDQN:
 
 def play(args: argparse.Namespace) -> None:
     torch.set_num_threads(args.torch_threads)
-    env = make_env(args, headless=args.headless)
+    env = make_env(args, headless=args.headless and not args.cdp_url)
     try:
         model = load_play_model(args.model, env, args.device)
         observation, _ = env.reset()
@@ -271,6 +317,12 @@ def add_environment_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("bundled", "chrome", "msedge"),
         default="bundled",
     )
+    parser.add_argument(
+        "--cdp-url",
+        default=None,
+        help="attach to an already running Chrome (e.g. http://localhost:9222) "
+        "instead of launching one",
+    )
     parser.add_argument("--keys", choices=("arrows", "ad"), default="arrows")
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--history", type=int, default=4)
@@ -321,6 +373,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="hide the browser window (default)",
     )
     train_parser.set_defaults(headed=False)
+    train_parser.add_argument(
+        "--envs",
+        type=int,
+        default=1,
+        help="number of browsers collecting experience in parallel (1-8)",
+    )
     train_parser.add_argument("--report-every", type=int, default=500)
     train_parser.add_argument("--save-every", type=int, default=50_000)
     train_parser.add_argument("--eval-every", type=int, default=50_000)
@@ -353,6 +411,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.eval_episodes < 1
     ):
         parser.error("training counts must be positive; --eval-every may be zero")
+    if args.command == "train" and not 1 <= args.envs <= 8:
+        parser.error("--envs must be between 1 and 8")
+    if args.command == "train" and args.envs > 1 and args.cdp_url:
+        parser.error("--cdp-url drives one existing Chrome; it cannot be used with --envs")
     if args.command == "evaluate" and args.episodes < 1:
         parser.error("--episodes must be positive")
     return args

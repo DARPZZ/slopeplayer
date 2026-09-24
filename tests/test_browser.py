@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import cv2
 import numpy as np
 
 from slope_core.browser import BrowserConfig, BrowserError, SlopeBrowser, normalize_game_url
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def make_browser(*, headless: bool = True, reset_attempts: int = 3) -> SlopeBrowser:
@@ -168,16 +171,57 @@ class BrowserTests(unittest.TestCase):
         browser._click_canvas = Mock(side_effect=lambda *_: events.append("click"))
         browser._park_mouse = Mock(side_effect=lambda: events.append("park"))
         frame = np.zeros((12, 16, 3), dtype=np.uint8)
+        browser._await_death_screen = Mock(side_effect=lambda: events.append("await"))
         browser._wait_for_running_frame = Mock(
-            side_effect=lambda: events.append("running") or frame
+            side_effect=lambda **_: events.append("running") or frame
         )
 
         browser.reset("terminated")
 
         browser._click_canvas.assert_called_once_with(0.50, 0.908)
         browser._park_mouse.assert_called_once_with()
-        browser._wait_for_running_frame.assert_called_once_with()
-        self.assertEqual(events, ["click", "running", "park"])
+        browser._wait_for_running_frame.assert_called_once_with(
+            retry_point=(0.50, 0.908)
+        )
+        self.assertEqual(events, ["await", "click", "running", "park"])
+
+    def test_restart_waits_for_again_after_a_frozen_screen_death(self) -> None:
+        browser = make_browser()
+        browser.clock_frozen = True
+        frozen = cv2.imread(str(FIXTURES / "exploding_480.jpg"), cv2.IMREAD_COLOR)
+        death = cv2.imread(str(FIXTURES / "death_480.jpg"), cv2.IMREAD_COLOR)
+        browser._advance_physics_ms = Mock()
+        browser._capture = Mock(side_effect=[frozen, frozen, death])
+
+        result = browser._await_death_screen()
+
+        self.assertIs(result, death)
+        self.assertEqual(browser._advance_physics_ms.call_args_list, [call(240), call(240)])
+
+    def test_missing_death_screen_is_a_browser_error(self) -> None:
+        browser = make_browser()
+        browser.clock_frozen = True
+        frozen = cv2.imread(str(FIXTURES / "exploding_480.jpg"), cv2.IMREAD_COLOR)
+        browser._advance_physics_ms = Mock()
+        browser._capture = Mock(return_value=frozen)
+
+        with self.assertRaises(BrowserError):
+            browser._await_death_screen()
+
+    def test_restart_never_accepts_death_screen_and_repeats_ignored_again(self) -> None:
+        browser = make_browser()
+        browser.clock_frozen = True
+        death = cv2.imread(str(FIXTURES / "death_480.jpg"), cv2.IMREAD_COLOR)
+        game = running_frame()
+        self.assertTrue(SlopeBrowser._looks_like_running_game(death))
+        browser._advance_physics_ms = Mock()
+        browser._click_canvas = Mock()
+        browser._capture = Mock(side_effect=[death] * 9 + [game])
+
+        result = browser._wait_for_running_frame(retry_point=(0.50, 0.908))
+
+        self.assertIs(result, game)
+        browser._click_canvas.assert_called_once_with(0.50, 0.908)
 
     def test_mouse_is_parked_in_safe_canvas_corner(self) -> None:
         browser = make_browser()
@@ -543,8 +587,6 @@ class BrowserTests(unittest.TestCase):
         self.assertFalse(browser.clock_frozen)
 
     def test_concurrent_browsers_share_one_playwright_driver(self) -> None:
-        # The sync API cannot start a second driver on the same thread, so the
-        # training and evaluation browsers must share one.
         driver = Mock()
         driver.chromium.launch.return_value.new_context.return_value.new_page.return_value.goto.return_value = None
         starter = Mock()
@@ -578,7 +620,6 @@ class BrowserTests(unittest.TestCase):
             training.close()
             driver.stop.assert_called_once_with()
 
-            # A browser launched after the last one closed starts a new driver.
             late = launched()
             self.assertEqual(starter.return_value.start.call_count, 2)
             late.close()

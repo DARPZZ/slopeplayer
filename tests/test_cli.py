@@ -21,6 +21,19 @@ class CliTests(unittest.TestCase):
         args = parse_args(["train"])
         self.assertEqual(args.eval_episodes, 10)
 
+    def test_training_uses_one_browser_by_default(self) -> None:
+        self.assertEqual(parse_args(["train"]).envs, 1)
+        self.assertEqual(parse_args(["train", "--envs", "3"]).envs, 3)
+
+    def test_browser_count_is_bounded(self) -> None:
+        for count in ("0", "9"):
+            with self.subTest(count=count), self.assertRaises(SystemExit):
+                parse_args(["train", "--envs", count])
+
+    def test_parallel_browsers_cannot_share_one_cdp_chrome(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_args(["train", "--envs", "2", "--cdp-url", "http://localhost:9222"])
+
     def test_fresh_run_rejects_any_latest_or_best_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory) / "agent"

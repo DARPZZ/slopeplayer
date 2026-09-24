@@ -23,3 +23,5 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["slope_core*"]
 
+[tool.setuptools.package-data]
+slope_core = ["assets/*.npz"]

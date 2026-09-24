@@ -18,23 +18,25 @@ from urllib.parse import urljoin, urlparse
 import cv2
 import numpy as np
 
+from .vision import detect_game_over
+
 
 Y8_EMBED_URL = "https://www.y8.com/embed/{slug}"
 _PHYSICS_SLICE_MS = 16
 _RESET_PHYSICS_FRAMES = 3
 _RESET_POLL_MS = _RESET_PHYSICS_FRAMES * _PHYSICS_SLICE_MS
 _RESET_MAX_TRANSITION_MS = 2_000
+_START_POINT = (0.50, 0.462)
+_AGAIN_POINT = (0.50, 0.908)
+_AGAIN_RETRY_MS = 8 * _RESET_POLL_MS
+_DEATH_SCREEN_MAX_WAIT_MS = 6_000
+_DEATH_SCREEN_POLL_MS = 240
 _MENU_POLL_MS = 64
 _AD_POLL_MS = 250
 _AD_AFTER_CLICK_MS = _RESET_POLL_MS
 _AD_MAX_WAIT_MS = 30_000
 _RESET_REASONS = frozenset({"initial", "terminated", "truncated", "manual"})
 
-# Y8 occasionally attaches pop-under handlers to the game page or one of its
-# advertising frames.  Playwright's page event lets us close the resulting tab,
-# but preventing it in the first place avoids a visible flash in headed mode and
-# avoids a short-lived extra renderer in headless training.  Context init scripts
-# run in the owner page and every child frame before site JavaScript executes.
 _POPUP_GUARD_SCRIPT = """
 (() => {
     window.open = () => null;
@@ -68,10 +70,6 @@ class BrowserError(RuntimeError):
     """Raised when the game browser cannot provide a valid transition."""
 
 
-# Playwright's sync API permits only one started instance per thread; a second
-# ``sync_playwright().start()`` fails while the first is running.  Training and
-# its periodic evaluation each own a browser, so both launch from one shared,
-# reference-counted driver that stops only after the last browser closes.
 _shared_playwright: Any | None = None
 _shared_playwright_users = 0
 
@@ -90,7 +88,6 @@ def _acquire_playwright() -> Any:
 def _release_playwright(instance: Any) -> None:
     global _shared_playwright, _shared_playwright_users
     if instance is not _shared_playwright:
-        # Not the shared driver (already stopped, or supplied directly).
         instance.stop()
         return
     _shared_playwright_users -= 1
@@ -130,6 +127,7 @@ class BrowserConfig:
     screenshot_format: str = "jpeg"
     jpeg_quality: int = 70
     reset_attempts: int = 3
+    cdp_url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.url.strip():
@@ -199,28 +197,10 @@ class SlopeBrowser:
 
         try:
             self.playwright = _acquire_playwright()
-            self.browser = self.playwright.chromium.launch(
-                channel=self.playwright_channel,
-                headless=self.config.headless,
-                ignore_default_args=["--disable-popup-blocking"],
-                args=[
-                    "--enable-webgl",
-                    "--ignore-gpu-blocklist",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-renderer-backgrounding",
-                ],
-            )
-            self.context = self.browser.new_context(
-                viewport={
-                    "width": self.config.viewport_width,
-                    "height": self.config.viewport_height,
-                },
-                device_scale_factor=1,
-                locale="en-US",
-            )
-            self.context.add_init_script(_POPUP_GUARD_SCRIPT)
-            self.page = self.context.new_page()
+            if self.config.cdp_url:
+                self._attach_over_cdp()
+            else:
+                self._launch_owned_browser()
             self._install_popup_handlers()
             self.page.clock.install(time=time.time())
             self.page.set_default_timeout(self.config.operation_timeout_ms)
@@ -242,11 +222,61 @@ class SlopeBrowser:
             self.close()
             if isinstance(exc, BrowserError):
                 raise
-            hint = (
-                " Install Chrome or Edge, or install bundled Chromium with "
-                "`python -m playwright install chromium`."
-            )
+            if self.config.cdp_url:
+                hint = (
+                    f" Start Chrome with --remote-debugging-port and make sure "
+                    f"{self.config.cdp_url} is reachable."
+                )
+            else:
+                hint = (
+                    " Install Chrome or Edge, or install bundled Chromium with "
+                    "`python -m playwright install chromium`."
+                )
             raise BrowserError(f"{self.worker_name}: browser launch failed: {exc}.{hint}") from exc
+
+    def _launch_owned_browser(self) -> None:
+        assert self.playwright is not None
+        self.browser = self.playwright.chromium.launch(
+            channel=self.playwright_channel,
+            headless=self.config.headless,
+            ignore_default_args=["--disable-popup-blocking"],
+            args=[
+                "--enable-webgl",
+                "--ignore-gpu-blocklist",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+            ],
+        )
+        self.context = self.browser.new_context(
+            viewport={
+                "width": self.config.viewport_width,
+                "height": self.config.viewport_height,
+            },
+            device_scale_factor=1,
+            locale="en-US",
+        )
+        self.context.add_init_script(_POPUP_GUARD_SCRIPT)
+        self.page = self.context.new_page()
+
+    def _attach_over_cdp(self) -> None:
+        """Drive the most recently opened tab of a Chrome the user started."""
+
+        assert self.playwright is not None
+        self.browser = self.playwright.chromium.connect_over_cdp(self.config.cdp_url)
+        if not self.browser.contexts:
+            raise BrowserError("Connected Chrome has no open window")
+        self.context = self.browser.contexts[0]
+        self.context.add_init_script(_POPUP_GUARD_SCRIPT)
+        pages = [page for page in self.context.pages if not page.is_closed()]
+        self.page = pages[-1] if pages else self.context.new_page()
+        self.page.set_viewport_size(
+            {
+                "width": self.config.viewport_width,
+                "height": self.config.viewport_height,
+            }
+        )
+        self.page.bring_to_front()
 
     @staticmethod
     def _check_response(response: Any | None, url: str) -> None:
@@ -260,7 +290,6 @@ class SlopeBrowser:
         try:
             popup.close()
         except Exception:
-            # Popups frequently close themselves before the event is handled.
             pass
         if not self.config.headless and self.page is not None:
             try:
@@ -268,9 +297,6 @@ class SlopeBrowser:
             except Exception:
                 pass
         if game_was_started:
-            # Unity pauses Slope when an advertising page steals visibility.
-            # Remember that the centered Resume control may need one click once
-            # execution returns to the owner page.
             self.resume_after_popup = True
 
     @staticmethod
@@ -280,7 +306,6 @@ class SlopeBrowser:
         try:
             dialog.dismiss()
         except Exception:
-            # A page navigation can dispose a dialog before its event runs.
             pass
 
     def _install_popup_handlers(self) -> None:
@@ -288,14 +313,13 @@ class SlopeBrowser:
 
         if self.context is None or self.page is None:
             raise BrowserError("Cannot install popup handlers before creating a page")
-        # Register after creating the owner page so it cannot be mistaken for
-        # an advertising popup by a synchronous context event callback.
-        self.context.on("page", self._close_popup)
+        if not self.config.cdp_url:
+            self.context.on("page", self._close_popup)
         self.page.on("popup", self._close_popup)
         self.page.on("dialog", self._dismiss_dialog)
 
     def _close_extra_pages(self) -> None:
-        if self.context is None:
+        if self.context is None or self.config.cdp_url:
             return
         for candidate in tuple(self.context.pages):
             if candidate is not self.page:
@@ -337,7 +361,6 @@ class SlopeBrowser:
                 timeout=round(self.config.load_timeout_s * 1000),
             )
         except Exception:
-            # Some Y8 revisions put the Unity canvas directly on the embed page.
             return
         source = embed.get_attribute("src")
         if not source:
@@ -373,7 +396,6 @@ class SlopeBrowser:
                             score *= 2.0
                         candidates.append((score, frame, locator))
                 except Exception:
-                    # Ads and consent helpers create short-lived frames.
                     continue
             if candidates:
                 _, self.canvas_frame, self.canvas = max(
@@ -532,7 +554,6 @@ class SlopeBrowser:
                 x, y, panel_width, panel_height = panel
                 box = self._canvas_box()
                 frame_height, frame_width = frame.shape[:2]
-                # Sourcepoint's three choices place Reject in the lower middle.
                 self.page.mouse.click(
                     box["x"] + (x + panel_width * 0.50) * box["width"] / frame_width,
                     box["y"] + (y + panel_height * 0.82) * box["height"] / frame_height,
@@ -561,9 +582,6 @@ class SlopeBrowser:
         panel_x, panel_top, panel_width, _ = panel
         panel_right = panel_x + panel_width
 
-        # Search only immediately above the panel's right edge.  In the real
-        # 640x400 captures this contains the six small components in "Close"
-        # and is empty while the ad is still in its mandatory viewing period.
         x0 = max(0, panel_right - round(width * 0.12))
         x1 = min(width, panel_right + round(width * 0.03))
         y0 = max(0, panel_top - round(height * 0.12))
@@ -625,9 +643,6 @@ class SlopeBrowser:
             self._click_frame_point(frame, point)
             return True
 
-        # SDK-specific class/id names are useful before the label renders, but
-        # are intentionally last because creatives often contain unrelated
-        # elements whose class also includes the word "close".
         close = self._visible_locator(_AD_GENERIC_CLOSE_SELECTORS)
         if close is None:
             return False
@@ -667,9 +682,6 @@ class SlopeBrowser:
             self._close_extra_pages()
             frame = self._capture()
 
-        # Y8/Unity commonly pauses after an ad or its pop-under takes focus.
-        # Clicking the canvas center activates Resume when present and is inert
-        # during ordinary keyboard-controlled Slope gameplay.
         self._click_resume_control()
         frame = self._capture()
         print(f"{self.worker_name}: dismissed an interstitial ad", flush=True)
@@ -682,10 +694,6 @@ class SlopeBrowser:
         height, width = frame.shape[:2]
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         green = cv2.inRange(hsv, (32, 70, 40), (100, 255, 255))
-        # Before START is clicked, Slope's only green-rich canvas state is its
-        # rendered menu. This also survives theme/ad variants whose PLAY border
-        # is not consistently red. The Unity splash and consent card both fail
-        # this saturated-neon threshold.
         del height, width
         return bool(np.count_nonzero(green) / green.size >= 0.006)
 
@@ -736,9 +744,6 @@ class SlopeBrowser:
         if self.clock_frozen:
             return
 
-        # Reading the emulated clock avoids asking Clock to travel backwards if
-        # navigation took longer than expected.  Small margins handle call
-        # latency without consuming meaningful game time (the game is at menu).
         last_error: Exception | None = None
         for margin in (0.05, 0.10, 0.25):
             try:
@@ -782,8 +787,6 @@ class SlopeBrowser:
 
     def _release_keys(self) -> None:
         if self.page is not None:
-            # Release both keys even if local direction state became stale after
-            # a navigation or interrupted transition.
             self.page.keyboard.up(self.left_key)
             self.page.keyboard.up(self.right_key)
         self.direction = 0
@@ -805,19 +808,27 @@ class SlopeBrowser:
             self.page.keyboard.down(self.right_key)
         self.direction = direction
 
-    def _wait_for_running_frame(self) -> np.ndarray:
+    def _wait_for_running_frame(
+        self, retry_point: tuple[float, float] | None = None
+    ) -> np.ndarray:
         """Return the earliest rendered game frame after START/AGAIN.
 
         Unity briefly renders black while changing scenes. Polling in three
         display-frame chunks does not confuse that transition with an episode,
         and exposes the first controllable frame with at most 48 ms latency.
+
+        The death screen is green enough to pass for gameplay, so it is never
+        accepted.  While it persists after a click, ``retry_point`` is clicked
+        again.
         """
 
         advanced = 0
+        since_click = 0
         last_frame: np.ndarray | None = None
         while advanced < _RESET_MAX_TRANSITION_MS:
             self._advance_physics_ms(_RESET_POLL_MS)
             advanced += _RESET_POLL_MS
+            since_click += _RESET_POLL_MS
             self._close_extra_pages()
             self._resume_after_closed_popup()
             last_frame = self._capture()
@@ -825,6 +836,11 @@ class SlopeBrowser:
                 last_frame = self._dismiss_interstitial(last_frame)
                 if self._resume_after_closed_popup():
                     last_frame = self._capture()
+            if detect_game_over(last_frame):
+                if retry_point is not None and since_click >= _AGAIN_RETRY_MS:
+                    self._click_canvas(*retry_point)
+                    since_click = 0
+                continue
             if self._looks_like_running_game(last_frame):
                 return last_frame
         details = ""
@@ -846,16 +862,38 @@ class SlopeBrowser:
 
     def _start_from_menu(self) -> np.ndarray:
         self._release_keys()
-        self._click_canvas(0.50, 0.462)
+        self._click_canvas(*_START_POINT)
         frame = self._wait_for_running_frame()
         self._park_mouse()
         self.started = True
         return frame
 
+    def _await_death_screen(self) -> np.ndarray:
+        """Advance game time until the AGAIN control is visible.
+
+        The environment may end an episode when the scene freezes after a
+        crash, which is ~2.6 s of game time before Slope draws AGAIN.
+        """
+
+        advanced = 0
+        while True:
+            frame = self._capture()
+            if self._looks_like_interstitial(frame):
+                frame = self._dismiss_interstitial(frame)
+            if detect_game_over(frame):
+                return frame
+            if advanced >= _DEATH_SCREEN_MAX_WAIT_MS:
+                raise BrowserError(f"{self.worker_name}: death screen did not appear")
+            # Nothing is controllable here, so coarse polling only saves
+            # screenshots; it never changes what the agent experiences.
+            self._advance_physics_ms(_DEATH_SCREEN_POLL_MS)
+            advanced += _DEATH_SCREEN_POLL_MS
+
     def _restart_after_death(self) -> np.ndarray:
         self._release_keys()
-        self._click_canvas(0.50, 0.908)
-        frame = self._wait_for_running_frame()
+        self._await_death_screen()
+        self._click_canvas(*_AGAIN_POINT)
+        frame = self._wait_for_running_frame(retry_point=_AGAIN_POINT)
         self._park_mouse()
         self.started = True
         return frame
@@ -891,8 +929,6 @@ class SlopeBrowser:
         elif reason == "terminated":
             return self._restart_after_death()
         else:
-            # A truncation/manual reset can occur while the ball is alive, so
-            # the death-screen AGAIN button is not guaranteed to exist.
             self._reload_to_menu()
             return self._start_from_menu()
 
@@ -941,8 +977,6 @@ class SlopeBrowser:
                 frame = self._dismiss_interstitial(frame)
                 if self._resume_after_closed_popup():
                     frame = self._capture()
-                # Dismissal releases both keys. Restore the requested control
-                # without advancing extra gameplay time after the ad unpauses.
                 self._set_direction(direction)
             return frame
         except (BrowserError, ValueError):
@@ -958,11 +992,12 @@ class SlopeBrowser:
         except Exception:
             self.direction = 0
         try:
-            if self.context is not None:
+            if self.context is not None and not self.config.cdp_url:
                 self.context.close()
         except Exception:
             pass
         try:
+            # For a CDP connection this only disconnects; Chrome stays open.
             if self.browser is not None:
                 self.browser.close()
         except Exception:

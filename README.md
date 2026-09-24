@@ -1,14 +1,29 @@
 # Slope RL
 
-This is a clean-slate reinforcement-learning agent for Y8 Slope. It uses
-colour-derived road, obstacle, motion, and game-over features from the real
-browser canvas, keeps four byte-packed frames of history, and learns the three
-actions left/neutral/right with QR-DQN. A model-side extractor converts the
-bytes back to normalized values only for sampled training batches.
+This is a clean-slate reinforcement-learning agent for Y8 Slope. Each frame
+of the real browser canvas is shrunk to a 64x40 image of its red and green
+intensity (Slope draws the road, ball, and buildings in green and deadly walls
+in red). Four byte-packed frames of history, with the action behind each,
+feed a small CNN that learns the three actions left/neutral/right with
+QR-DQN. The bytes are converted to normalized values only for sampled
+training batches.
 
 Slope is endless, so there is no final level to beat. The default success goal
 is surviving for 180 seconds; the best checkpoint is selected by deterministic
 median survival, with 25th-percentile survival as the tie-breaker.
+
+A run ends at the first of two death signals:
+
+- **Frozen screen.** Slope's camera never stops while the ball is alive. About a
+  second after a crash the scene freezes, roughly 2.6 s before the death screen
+  appears. Ending the episode here puts the penalty close to the mistake that
+  caused it.
+- **Death screen.** The AGAIN, Menu, and Leaderboard controls are matched
+  against templates taken from real captures (`slope_core/assets`), so the
+  check works at any capture width and JPEG quality.
+
+Exploration holds each random action for 2–8 steps, rather than picking a new
+one every step, so random play actually tries different paths through turns.
 
 ## Install
 
@@ -44,7 +59,8 @@ python slope.py doctor --browser-channel bundled
 ```
 
 It drives three forced trajectories, checks the observation contract and death
-detector, and writes diagnostic frames to `artifacts/doctor`. It must report
+detector, and writes diagnostic frames to `artifacts/doctor`. Each line names
+the signal that ended the run (`frozen_screen` or `retry_screen`). It must report
 `Environment validation passed`. Add `--headed` if you want to watch it:
 
 ```powershell
@@ -81,6 +97,21 @@ latest model and replay buffer are saved before exit.
 
 Use a new `--model` name for a separate experiment. Fresh training refuses to
 overwrite an existing latest model or replay unless `--overwrite` is supplied.
+
+### Parallel browsers
+
+Browser collection is the bottleneck, so `--envs` runs several browsers at
+once, each in its own worker process:
+
+```powershell
+python slope.py train --model runs/slope_qrdqn --steps 500000 --envs 3 --device cuda
+```
+
+`--steps` counts transitions from all browsers together, and the network still
+makes one update per transition. Each extra browser needs roughly one CPU core
+and 0.5-1 GB of RAM; the replay size does not change. A run must be resumed
+with the same `--envs` value it was started with, because the replay keeps a
+separate transition sequence per browser.
 
 ## Resume training
 
@@ -147,9 +178,10 @@ The most useful values are:
   to estimate seconds.
 - `ep_rew_mean`: exploratory reward including the death and action-change
   penalties. It should rise with survival but is not the selection metric.
-- `exploration_rate`: random-action probability. It anneals from 1.0 to 0.03
-  over the first 30% of the fresh run's `--steps`. That length is stored in
-  the checkpoint, so resuming never raises exploration again.
+- `exploration_rate`: probability of starting a held random action. It
+  anneals from 1.0 to 0.01 over the first 10% of the fresh run's `--steps`.
+  That length is stored in the checkpoint, so resuming never raises
+  exploration again.
 - `loss`: the QR-DQN optimization loss. It should remain finite, but lower is
   not automatically better gameplay.
 - `throughput` or `fps`: collected transitions per wall-clock second, not the
@@ -161,19 +193,19 @@ evaluations rather than one unusually long run.
 
 ## CPU, CUDA, RAM, and disk
 
-The default observation contains 2,608 `uint8` values: 649 colour/geometry
-features plus a three-value one-hot action, across four frames. The 150,000-entry
+The default observation contains 20,492 `uint8` values: a 2x40x64 red/green
+image plus a three-value one-hot action, across four frames. The 100,000-entry
 five-step replay stores current and next observations and eventually occupies
-about 0.78 GB (0.73 GiB) of host RAM. Its `.replay.pkl` checkpoint is
+about 4.1 GB (3.8 GiB) of host RAM. Its `.replay.pkl` checkpoint is
 approximately the same size. While replacing an existing replay checkpoint,
-the old and temporary new files can briefly require about 1.6 GB of disk space;
-keep at least 3-4 GB free.
+the old and temporary new files can briefly require about 8.2 GB of disk space;
+keep at least 12 GB free.
 
-Twelve GB of system RAM is a practical minimum and 16-24 GB is preferable when
-Chromium is running. The replay lives in system RAM, not GPU memory.
+Sixteen GB of system RAM is a practical minimum and 24 GB or more is
+preferable when several Chromium browsers are running. The replay lives in system RAM, not GPU memory.
 
 CUDA accelerates the batched QR-DQN network updates, but Chromium rendering,
-screenshots, and OpenCV feature extraction remain CPU-bound. GPU use therefore
+and screenshots remain CPU-bound. GPU use therefore
 does not make browser collection run at 60 transitions/s. The default
 20-decision/s simulated control rate is intentional. Keep
 `--torch-threads 2` initially so Chromium retains CPU time; benchmark 2 versus

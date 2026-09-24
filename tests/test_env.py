@@ -13,16 +13,13 @@ class FakeEncoder:
     def reset(self) -> None:
         pass
 
-    def encode(self, frame, previous_frame=None):
+    def encode(self, frame):
         dead = bool(frame[0, 0, 0] == 255)
         value = float(frame[0, 0, 1]) / 255
-        motion = 0.0 if previous_frame is None else 0.5
         return SimpleNamespace(
-            vector=np.asarray((value, motion), dtype=np.float32),
+            vector=np.asarray((value, 0.0), dtype=np.float32),
             game_over=dead,
             game_over_confidence=1.0 if dead else 0.0,
-            green_fraction=value,
-            red_fraction=0.0,
         )
 
 
@@ -32,11 +29,15 @@ class FakeBrowser:
         self.steps = []
         self.dead_next = False
         self.fail_next = False
+        self.moving = True
         self.closed = False
 
     @staticmethod
-    def frame(value=64, dead=False):
+    def frame(value=64, dead=False, texture=0):
         frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        # Pixels outside [0, 0] are ignored by FakeEncoder; they only give the
+        # frame the change a moving camera produces.
+        frame[1:, :, :] = texture
         frame[0, 0, 1] = value
         frame[0, 0, 0] = 255 if dead else 0
         return frame
@@ -50,7 +51,8 @@ class FakeBrowser:
         if self.fail_next:
             self.fail_next = False
             raise BrowserError("renderer stopped")
-        frame = self.frame(value=128, dead=self.dead_next)
+        texture = (len(self.steps) % 2) * 100 if self.moving else 0
+        frame = self.frame(value=128, dead=self.dead_next, texture=texture)
         self.dead_next = False
         return frame
 
@@ -91,7 +93,7 @@ class SlopeEnvironmentTests(unittest.TestCase):
         env.reset()
         _, reward, terminated, truncated, info = env.step(0)
         self.assertEqual(browser.steps, [(-1, 0.05)])
-        self.assertAlmostEqual(reward, 0.009)  # 0.20/20 minus switch cost
+        self.assertAlmostEqual(reward, 0.009)
         self.assertFalse(terminated)
         self.assertFalse(truncated)
         self.assertEqual(info["survival_steps"], 1)
@@ -106,6 +108,7 @@ class SlopeEnvironmentTests(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertEqual(reward, -1.0)
         self.assertTrue(info["game_over"])
+        self.assertEqual(info["death_signal"], "retry_screen")
         with self.assertRaises(RuntimeError):
             env.step(1)
         env.reset()
@@ -124,6 +127,32 @@ class SlopeEnvironmentTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertAlmostEqual(reward, 0.02)
         self.assertTrue(info["target_survival_reached"])
+        env.close()
+
+    def test_frozen_screen_is_a_death_before_retry_ui_appears(self):
+        env, browser = self.make_env(fps=12, death_freeze_seconds=0.25)
+        browser.moving = False
+        env.reset()
+        # The first step differs from the reset frame; three still steps follow.
+        results = [env.step(1) for _ in range(4)]
+        for _, _, terminated, truncated, _ in results[:-1]:
+            self.assertFalse(terminated or truncated)
+        _, reward, terminated, truncated, info = results[-1]
+        self.assertTrue(terminated)
+        self.assertFalse(truncated)
+        self.assertEqual(reward, -1.0)
+        self.assertFalse(info["game_over"])
+        self.assertEqual(info["death_signal"], "frozen_screen")
+        env.reset()
+        self.assertEqual(browser.reset_reasons[-1], "terminated")
+        env.close()
+
+    def test_moving_screen_never_counts_as_frozen(self):
+        env, _ = self.make_env(fps=12, max_episode_seconds=60)
+        env.reset()
+        for _ in range(40):
+            _, _, terminated, truncated, _ = env.step(1)
+            self.assertFalse(terminated or truncated)
         env.close()
 
     def test_browser_failure_is_not_reported_as_a_death(self):

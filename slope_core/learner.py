@@ -1,8 +1,9 @@
 """QR-DQN construction, persistence, progress reporting, and evaluation.
 
 This module deliberately knows nothing about the browser environment. The
-training environment only needs a byte-packed flat Box observation and a
-three-action Discrete action space.
+training environment only needs a three-action Discrete action space and a
+byte-packed flat Box observation made of history entries, each one frame image
+followed by the one-hot action that produced it.
 """
 
 from __future__ import annotations
@@ -18,47 +19,96 @@ from typing import Any
 import numpy as np
 import torch
 from gymnasium import spaces
+from torch import nn
 from sb3_contrib import QRDQN
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
+from .vision import FRAME_SHAPE
 
-class Uint8VectorExtractor(BaseFeaturesExtractor):
-    """Convert a byte-packed flat observation back to normalized floats.
 
-    Keeping histories as uint8 cuts replay memory by four while preserving all
-    values to 1/255 resolution. The conversion happens only for sampled batches
-    on the model's device, so the replay itself remains compact in host RAM.
+class FrameStackExtractor(BaseFeaturesExtractor):
+    """CNN over the stacked frame images, joined with the recent actions.
+
+    The flat uint8 observation holds ``history`` entries, each a
+    ``frame_shape`` image followed by a one-hot action.  Keeping it as bytes
+    cuts replay memory by four; conversion to [0, 1] floats happens only for
+    sampled batches on the model's device.  The frames are stacked as channels
+    so the first layer sees motion across the whole history.
     """
 
-    def __init__(self, observation_space: spaces.Box) -> None:
+    def __init__(
+        self,
+        observation_space: spaces.Box,
+        frame_shape: tuple[int, int, int] = FRAME_SHAPE,
+        action_dim: int = 3,
+        image_features: int = 512,
+    ) -> None:
         if len(observation_space.shape) != 1:
-            raise ValueError("Uint8VectorExtractor requires a flat observation")
+            raise ValueError("FrameStackExtractor requires a flat observation")
         if observation_space.dtype != np.uint8:
-            raise ValueError("Uint8VectorExtractor requires uint8 observations")
-        features_dim = int(np.prod(observation_space.shape))
-        super().__init__(observation_space, features_dim=features_dim)
+            raise ValueError("FrameStackExtractor requires uint8 observations")
+        channels, height, width = frame_shape
+        frame_size = channels * height * width
+        entry_size = frame_size + action_dim
+        total = int(observation_space.shape[0])
+        if total % entry_size:
+            raise ValueError(
+                f"observation length {total} is not a whole number of "
+                f"{frame_shape} frames with {action_dim} action values"
+            )
+        history = total // entry_size
+        super().__init__(observation_space, features_dim=image_features + history * action_dim)
+        self.history = history
+        self.frame_shape = (channels, height, width)
+        self.frame_size = frame_size
+        self.entry_size = entry_size
+        self.cnn = nn.Sequential(
+            nn.Conv2d(history * channels, 32, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            flat = self.cnn(torch.zeros(1, history * channels, height, width)).shape[1]
+        self.linear = nn.Sequential(nn.Linear(flat, image_features), nn.ReLU())
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        flattened = observations.reshape(observations.shape[0], -1).float()
-        return flattened / 255.0
+        count = observations.shape[0]
+        entries = observations.reshape(count, self.history, self.entry_size).float() / 255.0
+        channels, height, width = self.frame_shape
+        frames = entries[:, :, : self.frame_size].reshape(
+            count, self.history * channels, height, width
+        )
+        actions = entries[:, :, self.frame_size :].reshape(count, -1)
+        return torch.cat((self.linear(self.cnn(frames)), actions), dim=1)
 
 
-DEFAULT_EXPLORATION_STEPS = 150_000
+DEFAULT_EXPLORATION_STEPS = 50_000
+DEFAULT_EXPLORATION_HOLD = (2, 8)
 
 
 class SlopeQRDQN(QRDQN):
-    """QR-DQN whose exploration anneals over absolute timesteps.
+    """QR-DQN with resume-safe, temporally extended epsilon-greedy exploration.
 
     SB3 anneals epsilon over a fraction of the ``total_timesteps`` given to
     each ``learn()`` call, and a resume adds that request to the steps already
     taken.  Every resume therefore stretches the schedule and raises epsilon
     again.  ``exploration_steps`` is saved with the model, so the schedule set
     at the start of a run survives any number of resumes.
+
+    A random steering action lasting one control step barely moves the ball,
+    and independent random steps average out to driving straight.  Each random
+    action is therefore held for a uniformly drawn ``exploration_hold`` number
+    of steps (the "ez-greedy" scheme of Dabney et al., 2021), which explores
+    genuinely different lines through turns.
     """
 
-    # Class-level fallback for checkpoints saved before this attribute existed.
     exploration_steps: int = DEFAULT_EXPLORATION_STEPS
+    exploration_hold: tuple[int, int] = DEFAULT_EXPLORATION_HOLD
 
     def exploration_at(self, timesteps: int) -> float:
         progress = min(1.0, timesteps / max(1, self.exploration_steps))
@@ -69,6 +119,54 @@ class SlopeQRDQN(QRDQN):
         super()._on_step()
         self.exploration_rate = self.exploration_at(self.num_timesteps)
         self.logger.record("rollout/exploration_rate", self.exploration_rate)
+
+    def _sample_action(
+        self,
+        learning_starts: int,
+        action_noise: Any = None,
+        n_envs: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        holds = getattr(self, "_exploration_holds", None)
+        if holds is None or len(holds) != n_envs:
+            self._exploration_holds = np.zeros(n_envs, dtype=np.int64)
+            self._held_actions = np.zeros(n_envs, dtype=np.int64)
+        warmup = self.num_timesteps < learning_starts
+        shortest, longest = self.exploration_hold
+        actions = np.empty(n_envs, dtype=np.int64)
+        greedy: np.ndarray | None = None
+        for index in range(n_envs):
+            if self._exploration_holds[index] > 0:
+                self._exploration_holds[index] -= 1
+            elif warmup or np.random.rand() < self.exploration_rate:
+                self._held_actions[index] = int(self.action_space.sample())
+                self._exploration_holds[index] = np.random.randint(shortest, longest + 1) - 1
+            else:
+                if greedy is None:
+                    assert self._last_obs is not None, "self._last_obs was not set"
+                    predicted, _ = self.policy.predict(self._last_obs, deterministic=True)
+                    greedy = np.asarray(predicted).reshape(-1)
+                actions[index] = greedy[index]
+                continue
+            actions[index] = self._held_actions[index]
+        return actions, actions
+
+    def _store_transition(
+        self,
+        replay_buffer: Any,
+        buffer_action: np.ndarray,
+        new_obs: Any,
+        reward: np.ndarray,
+        dones: np.ndarray,
+        infos: list[dict[str, Any]],
+    ) -> None:
+        super()._store_transition(replay_buffer, buffer_action, new_obs, reward, dones, infos)
+        holds = getattr(self, "_exploration_holds", None)
+        if holds is not None:
+            # A random hold never carries into the next episode.
+            holds[np.asarray(dones, dtype=bool).reshape(-1)] = 0
+
+    def _excluded_save_params(self) -> list[str]:
+        return [*super()._excluded_save_params(), "_exploration_holds", "_held_actions"]
 
 
 @dataclass(frozen=True)
@@ -97,6 +195,7 @@ def build_qrdqn(
     device: str = "auto",
     seed: int = 7,
     exploration_steps: int = DEFAULT_EXPLORATION_STEPS,
+    frame_shape: tuple[int, int, int] = FRAME_SHAPE,
 ) -> SlopeQRDQN:
     """Build the sample-efficient default learner for Slope."""
 
@@ -106,28 +205,33 @@ def build_qrdqn(
         "MlpPolicy",
         env,
         learning_rate=1e-4,
-        buffer_size=150_000,
+        # Each 4-frame observation is ~20 KB and the replay stores it twice
+        # (current and next), so 100k transitions use ~4.1 GB of host RAM.
+        buffer_size=100_000,
         learning_starts=10_000,
         batch_size=256,
         gamma=0.997,
         train_freq=(4, "step"),
-        gradient_steps=2,
+        # One update per collected transition, whatever the number of
+        # browsers (-1 means train_freq * n_envs).  Browser steps are
+        # expensive and the game clock is paused during updates, so extra
+        # replay only costs wall time.
+        gradient_steps=-1,
         n_steps=5,
         target_update_interval=5_000,
         exploration_initial_eps=1.0,
-        exploration_final_eps=0.03,
-        # SlopeQRDQN replaces SB3's relative schedule; see exploration_steps.
-        # SB3 2.9's NStepReplayBuffer rejects its memory-optimized layout.
+        # Held random actions last five steps on average, so 1% epsilon still
+        # leaves about 5% of late-training steps exploratory.
+        exploration_final_eps=0.01,
         optimize_memory_usage=False,
-        # Gymnasium truncations are not deaths. Bootstrap through the 180-second
-        # reporting cap and browser/infrastructure resets.
         replay_buffer_kwargs={"handle_timeout_termination": True},
         max_grad_norm=10.0,
         policy_kwargs={
-            "features_extractor_class": Uint8VectorExtractor,
+            "features_extractor_class": FrameStackExtractor,
+            "features_extractor_kwargs": {"frame_shape": tuple(frame_shape)},
             "normalize_images": False,
             "n_quantiles": 100,
-            "net_arch": [512, 512],
+            "net_arch": [512],
         },
         verbose=1,
         device=device,
@@ -188,6 +292,15 @@ def load_training_state(
         )
     model = SlopeQRDQN.load(paths.model, env=env, device=device)
     model.load_replay_buffer(paths.replay_buffer)
+    # The replay keeps one transition sequence per browser, so it can only
+    # continue with the browser count it was recorded with.
+    recorded = model.replay_buffer.n_envs
+    if recorded != model.n_envs:
+        raise ValueError(
+            f"{paths.replay_buffer} was recorded with {recorded} browser(s); "
+            f"resume with --envs {recorded} or start a new --model with "
+            f"--envs {model.n_envs}"
+        )
     return model
 
 

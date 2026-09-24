@@ -10,12 +10,13 @@ import numpy as np
 import torch
 from gymnasium import spaces
 from sb3_contrib import QRDQN
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 from slope_core.learner import (
     EvaluationResult,
     TrainingProgressCallback,
     SlopeQRDQN,
-    Uint8VectorExtractor,
+    FrameStackExtractor,
     build_qrdqn,
     checkpoint_paths,
     create_or_resume_qrdqn,
@@ -24,6 +25,11 @@ from slope_core.learner import (
     load_training_state,
     save_training_state,
 )
+
+
+# TinyEpisodeEnv observations are two history entries of a one-pixel frame
+# plus a three-value action.
+TINY_FRAME = (1, 1, 1)
 
 
 class TinyEpisodeEnv(gym.Env[np.ndarray, int]):
@@ -48,6 +54,27 @@ class TinyEpisodeEnv(gym.Env[np.ndarray, int]):
         return np.zeros(8, dtype=np.uint8), 1.0, terminated, False, {}
 
 
+
+class RecordingEnv(TinyEpisodeEnv):
+    def __init__(self, lengths: list[int]) -> None:
+        super().__init__(lengths)
+        self.actions: list[int] = []
+
+    def step(self, action: int):
+        self.actions.append(int(action))
+        return super().step(action)
+
+
+def run_lengths(values: list) -> list[int]:
+    runs = [1]
+    for previous, current in zip(values, values[1:]):
+        if current == previous:
+            runs[-1] += 1
+        else:
+            runs.append(1)
+    return runs
+
+
 class LearnerTests(unittest.TestCase):
     def test_build_qrdqn_uses_sample_efficient_configuration(self) -> None:
         env = TinyEpisodeEnv([1])
@@ -61,34 +88,37 @@ class LearnerTests(unittest.TestCase):
         self.assertEqual(qrdqn.call_args.args[0], "MlpPolicy")
         self.assertIs(qrdqn.call_args.args[1], env)
         kwargs = qrdqn.call_args.kwargs
-        self.assertEqual(kwargs["buffer_size"], 150_000)
+        self.assertEqual(kwargs["buffer_size"], 100_000)
         self.assertEqual(kwargs["learning_starts"], 10_000)
         self.assertEqual(kwargs["batch_size"], 256)
         self.assertAlmostEqual(kwargs["gamma"], 0.997)
         self.assertEqual(kwargs["n_steps"], 5)
         self.assertEqual(kwargs["train_freq"], (4, "step"))
-        self.assertEqual(kwargs["gradient_steps"], 2)
+        self.assertEqual(kwargs["gradient_steps"], -1)
         self.assertEqual(kwargs["target_update_interval"], 5_000)
         self.assertEqual(kwargs["exploration_initial_eps"], 1.0)
-        self.assertEqual(kwargs["exploration_final_eps"], 0.03)
+        self.assertEqual(kwargs["exploration_final_eps"], 0.01)
         self.assertFalse(kwargs["optimize_memory_usage"])
         self.assertEqual(
             kwargs["replay_buffer_kwargs"], {"handle_timeout_termination": True}
         )
         policy_kwargs = kwargs["policy_kwargs"]
-        self.assertIs(policy_kwargs["features_extractor_class"], Uint8VectorExtractor)
+        self.assertIs(policy_kwargs["features_extractor_class"], FrameStackExtractor)
+        self.assertEqual(
+            policy_kwargs["features_extractor_kwargs"], {"frame_shape": (2, 40, 64)}
+        )
         self.assertFalse(policy_kwargs["normalize_images"])
         self.assertEqual(policy_kwargs["n_quantiles"], 100)
-        self.assertEqual(policy_kwargs["net_arch"], [512, 512])
+        self.assertEqual(policy_kwargs["net_arch"], [512])
         self.assertEqual(kwargs["device"], "cuda")
         self.assertEqual(kwargs["seed"], 19)
         self.assertEqual(sentinel.exploration_steps, 12_345)
 
     def test_build_qrdqn_constructs_real_model(self) -> None:
-        model = build_qrdqn(TinyEpisodeEnv([1]), device="cpu", seed=3)
+        model = build_qrdqn(TinyEpisodeEnv([1]), device="cpu", frame_shape=TINY_FRAME, seed=3)
         try:
             self.assertEqual(model.n_steps, 5)
-            self.assertEqual(model.buffer_size, 150_000)
+            self.assertEqual(model.buffer_size, 100_000)
             self.assertEqual(model.policy.n_quantiles, 100)
             self.assertIsNotNone(model.replay_buffer)
             self.assertTrue(model.replay_buffer.handle_timeout_termination)
@@ -103,13 +133,13 @@ class LearnerTests(unittest.TestCase):
     def test_exploration_schedule_survives_save_and_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             model = build_qrdqn(
-                TinyEpisodeEnv([1]), device="cpu", seed=5, exploration_steps=1_000
+                TinyEpisodeEnv([1]), device="cpu", frame_shape=TINY_FRAME, seed=5, exploration_steps=1_000
             )
             path = Path(directory) / "model.zip"
             try:
                 self.assertAlmostEqual(model.exploration_at(0), 1.0)
-                self.assertAlmostEqual(model.exploration_at(500), 0.515)
-                self.assertAlmostEqual(model.exploration_at(5_000), 0.03)
+                self.assertAlmostEqual(model.exploration_at(500), 0.505)
+                self.assertAlmostEqual(model.exploration_at(5_000), 0.01)
                 model.save(path)
             finally:
                 model.get_env().close()
@@ -118,8 +148,6 @@ class LearnerTests(unittest.TestCase):
             )
             try:
                 self.assertEqual(loaded.exploration_steps, 1_000)
-                # A resumed learn() with a large new budget must not re-raise
-                # epsilon: it depends only on absolute timesteps.
                 loaded.num_timesteps = 500
                 loaded.learn(total_timesteps=10, reset_num_timesteps=False)
                 self.assertGreaterEqual(loaded.num_timesteps, 510)
@@ -131,19 +159,84 @@ class LearnerTests(unittest.TestCase):
             finally:
                 loaded.get_env().close()
 
-    def test_uint8_extractor_dequantizes_to_unit_interval(self) -> None:
-        observation_space = spaces.Box(0, 255, shape=(4,), dtype=np.uint8)
-        extractor = Uint8VectorExtractor(observation_space)
-        encoded = torch.tensor([[0, 64, 128, 255]], dtype=torch.float32)
-        decoded = extractor(encoded).detach().numpy()
-        np.testing.assert_allclose(
-            decoded,
-            np.asarray([[0.0, 64 / 255, 128 / 255, 1.0]], dtype=np.float32),
+    def test_random_exploration_holds_each_action_for_several_steps(self) -> None:
+        env = RecordingEnv([10_000])
+        model = build_qrdqn(env, device="cpu", frame_shape=TINY_FRAME, seed=11)
+        try:
+            model.learn(total_timesteps=400)
+            runs = run_lengths(env.actions)
+            shortest, longest = model.exploration_hold
+            # The final run may be cut off by the step budget.
+            self.assertGreaterEqual(min(runs[:-1]), shortest)
+            self.assertGreater(np.mean(runs[:-1]), shortest)
+            self.assertEqual(sorted(set(env.actions)), [0, 1, 2])
+        finally:
+            model.env.close()
+
+    def test_exploration_hold_is_cleared_at_episode_end(self) -> None:
+        model = build_qrdqn(TinyEpisodeEnv([3, 100]), device="cpu", frame_shape=TINY_FRAME, seed=13)
+        model.exploration_hold = (50, 50)
+        try:
+            # One four-step rollout: steps 1-3 use one 50-step hold, which is
+            # 47 steps from finishing when the episode ends.  Step 4 must start
+            # a fresh hold (49 remaining) instead of continuing the old one (46).
+            model.learn(total_timesteps=4)
+            self.assertEqual(model.num_timesteps, 4)
+            self.assertEqual(model._exploration_holds.tolist(), [49])
+        finally:
+            model.env.close()
+
+    def test_exploitation_uses_greedy_policy_after_hold_expires(self) -> None:
+        model = build_qrdqn(TinyEpisodeEnv([1]), device="cpu", frame_shape=TINY_FRAME, seed=17)
+        try:
+            model.exploration_rate = 0.0
+            model._last_obs = np.zeros((1, 8), dtype=np.uint8)
+            model._exploration_holds = np.array([1])
+            model._held_actions = np.array([0])
+            with patch.object(model.policy, "predict", return_value=(np.array([2]), None)):
+                held, _ = model._sample_action(learning_starts=0)
+                greedy, stored = model._sample_action(learning_starts=0)
+            self.assertEqual(held.tolist(), [0])
+            self.assertEqual(greedy.tolist(), [2])
+            self.assertEqual(stored.tolist(), [2])
+        finally:
+            model.env.close()
+
+    def test_frame_stack_extractor_splits_frames_and_actions(self) -> None:
+        # Two history entries of a 2x2 two-channel frame and a one-hot action.
+        entry = [0, 51, 102, 153, 204, 255, 0, 255] + [0, 255, 0]
+        observation_space = spaces.Box(0, 255, shape=(2 * len(entry),), dtype=np.uint8)
+        extractor = FrameStackExtractor(
+            observation_space, frame_shape=(2, 2, 2), image_features=16
         )
+        self.assertEqual(extractor.history, 2)
+        self.assertEqual(extractor.features_dim, 16 + 6)
+        self.assertEqual(extractor.cnn[0].in_channels, 4)
+
+        features = extractor(torch.tensor([entry * 2], dtype=torch.float32))
+
+        self.assertEqual(tuple(features.shape), (1, 22))
+        np.testing.assert_allclose(
+            features[0, 16:].detach().numpy(), [0, 1, 0, 0, 1, 0], atol=1e-6
+        )
+
+    def test_frame_stack_extractor_rejects_a_mismatched_layout(self) -> None:
+        observation_space = spaces.Box(0, 255, shape=(10,), dtype=np.uint8)
+        with self.assertRaisesRegex(ValueError, "whole number"):
+            FrameStackExtractor(observation_space, frame_shape=(1, 2, 2))
+
+    def test_frame_stack_extractor_reads_the_default_observation(self) -> None:
+        # Default 4-frame observation of 2x40x64 images plus actions.
+        size = 4 * (2 * 40 * 64 + 3)
+        extractor = FrameStackExtractor(
+            spaces.Box(0, 255, shape=(size,), dtype=np.uint8)
+        )
+        features = extractor(torch.zeros((3, size)))
+        self.assertEqual(tuple(features.shape), (3, 512 + 12))
 
     def test_custom_extractor_survives_model_save_and_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            model = build_qrdqn(TinyEpisodeEnv([1]), device="cpu", seed=5)
+            model = build_qrdqn(TinyEpisodeEnv([1]), device="cpu", frame_shape=TINY_FRAME, seed=5)
             path = Path(directory) / "model.zip"
             try:
                 model.save(path)
@@ -153,7 +246,7 @@ class LearnerTests(unittest.TestCase):
             try:
                 self.assertIsInstance(
                     loaded.policy.quantile_net.features_extractor,
-                    Uint8VectorExtractor,
+                    FrameStackExtractor,
                 )
                 action, _ = loaded.predict(
                     np.full(8, 255, dtype=np.uint8), deterministic=True
@@ -207,7 +300,8 @@ class LearnerTests(unittest.TestCase):
             paths = checkpoint_paths(root / "agent")
             paths.model.write_bytes(b"model")
             paths.replay_buffer.write_bytes(b"replay")
-            loaded = Mock()
+            loaded = Mock(n_envs=1)
+            loaded.replay_buffer.n_envs = 1
             with patch("slope_core.learner.SlopeQRDQN.load", return_value=loaded) as load:
                 result = load_training_state(
                     TinyEpisodeEnv([1]), root / "agent", device="cpu"
@@ -216,6 +310,38 @@ class LearnerTests(unittest.TestCase):
             self.assertIs(result, loaded)
             self.assertEqual(load.call_args.kwargs["device"], "cpu")
             loaded.load_replay_buffer.assert_called_once_with(paths.replay_buffer)
+
+    def test_parallel_envs_keep_one_update_per_transition(self) -> None:
+        env = DummyVecEnv([lambda: TinyEpisodeEnv([4] * 100) for _ in range(3)])
+        model = build_qrdqn(env, device="cpu", frame_shape=TINY_FRAME, seed=3)
+        model.learning_starts = 0
+        model.batch_size = 8
+        try:
+            with patch.object(model, "train") as train:
+                model.learn(total_timesteps=24)
+            updates = sum(call.kwargs["gradient_steps"] for call in train.call_args_list)
+            self.assertEqual(model.num_timesteps, 24)
+            self.assertEqual(updates, 24)
+        finally:
+            env.close()
+
+    def test_resume_rejects_a_different_browser_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent"
+            single = build_qrdqn(TinyEpisodeEnv([2] * 50), device="cpu", frame_shape=TINY_FRAME, seed=3)
+            single.learn(total_timesteps=10)
+            save_training_state(single, path)
+
+            parallel = DummyVecEnv([lambda: TinyEpisodeEnv([2] * 50) for _ in range(3)])
+            try:
+                with self.assertRaisesRegex(ValueError, "resume with --envs 1"):
+                    load_training_state(parallel, path, device="cpu")
+                resumed = load_training_state(
+                    TinyEpisodeEnv([2] * 50), path, device="cpu"
+                )
+                self.assertEqual(resumed.replay_buffer.n_envs, 1)
+            finally:
+                parallel.close()
 
     def test_fresh_start_does_not_require_checkpoint(self) -> None:
         env = TinyEpisodeEnv([1])
@@ -226,7 +352,7 @@ class LearnerTests(unittest.TestCase):
             )
         self.assertIs(result, fresh)
         build.assert_called_once_with(
-            env, device="cpu", seed=23, exploration_steps=150_000
+            env, device="cpu", seed=23, exploration_steps=50_000
         )
 
     def test_deterministic_evaluation_returns_lengths_rewards_and_rank(self) -> None:
