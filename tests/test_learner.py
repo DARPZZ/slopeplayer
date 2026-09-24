@@ -311,6 +311,17 @@ class LearnerTests(unittest.TestCase):
             self.assertEqual(load.call_args.kwargs["device"], "cpu")
             loaded.load_replay_buffer.assert_called_once_with(paths.replay_buffer)
 
+    def test_resume_explains_an_incompatible_observation_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = checkpoint_paths(root / "agent")
+            paths.model.write_bytes(b"model")
+            paths.replay_buffer.write_bytes(b"replay")
+            mismatch = ValueError("Observation spaces do not match: A != B")
+            with patch("slope_core.learner.SlopeQRDQN.load", side_effect=mismatch):
+                with self.assertRaisesRegex(ValueError, "--overwrite"):
+                    load_training_state(TinyEpisodeEnv([1]), root / "agent")
+
     def test_parallel_envs_keep_one_update_per_transition(self) -> None:
         env = DummyVecEnv([lambda: TinyEpisodeEnv([4] * 100) for _ in range(3)])
         model = build_qrdqn(env, device="cpu", frame_shape=TINY_FRAME, seed=3)

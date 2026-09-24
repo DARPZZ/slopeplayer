@@ -290,7 +290,17 @@ def load_training_state(
             "Cannot resume training without both the model and replay buffer; "
             f"missing: {listed}"
         )
-    model = SlopeQRDQN.load(paths.model, env=env, device=device)
+    try:
+        model = SlopeQRDQN.load(paths.model, env=env, device=device)
+    except ValueError as error:
+        # A checkpoint from an older observation layout cannot be resumed.
+        if "spaces do not match" not in str(error):
+            raise
+        raise ValueError(
+            f"{paths.model} was trained with a different observation or action "
+            f"layout and cannot be resumed ({error}). Start a new run with "
+            "another --model path, or pass --overwrite to replace it."
+        ) from error
     model.load_replay_buffer(paths.replay_buffer)
     # The replay keeps one transition sequence per browser, so it can only
     # continue with the browser count it was recorded with.
